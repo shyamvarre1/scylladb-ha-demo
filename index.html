@@ -135,6 +135,10 @@
 
   .toggle-row { display: flex; align-items: center; }
 
+  /* A control that the current mode doesn't use — dimmed in place rather than removed, so the
+     fact that it stopped applying is itself visible. */
+  .ctrl.is-disabled { opacity: .45; }
+
   /* ---------- main layout ---------- */
   .main {
     display: flex;
@@ -215,6 +219,10 @@
 
   .node-slot { fill: var(--surface); stroke: var(--ok); stroke-width: 2; cursor: pointer; transition: fill .15s, stroke .15s; }
   .node-slot.down { stroke: var(--text-faint); }
+  /* Raft-mode persistent markers, declared before .coordinator so a transient coordinator
+     highlight still wins on the node that happens to be both. */
+  .node-slot.raft-member { stroke-dasharray: 5 3; }
+  .node-slot.leader { stroke: var(--warn); stroke-width: 3; stroke-dasharray: none; }
   .node-slot.coordinator { stroke: var(--accent); stroke-width: 3; }
   .node-slot.replica { stroke-dasharray: 5 3; }
   .node-logo { pointer-events: none; transition: filter .15s, opacity .15s; }
@@ -225,6 +233,11 @@
   .node-sub.down { fill: var(--text-faint); }
   .node-kv { fill: var(--replica); font-family: var(--font-mono); font-size: 7.5px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; pointer-events: none; font-variant-numeric: tabular-nums; }
   .node-kv.empty { fill: var(--text-faint); font-weight: 400; font-style: italic; }
+
+  /* "L·t3" pill on the leader of the selected key's Raft group. Tinted fill + matching text
+     rather than solid-on-white, so it stays legible in every DS theme. */
+  .node-raft-badge { fill: var(--warn-bg); stroke: var(--warn); stroke-width: 1; pointer-events: none; }
+  .node-raft-badge-text { fill: var(--warn); font-family: var(--font-mono); font-size: 7.5px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
 
   .client-box { fill: var(--surface-2); stroke: var(--client); stroke-width: 2; cursor: default; }
   .client-label { fill: var(--client); font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
@@ -371,6 +384,16 @@
   </div>
 
   <div class="controls">
+    <div class="ctrl" title="Eventual consistency: every replica takes writes and RF/CL decides how many acks to wait for. Strong consistency: each key's replicas form a Raft group with one leader and majority commit.">
+      <label>Consistency Model</label>
+      <select id="modeSelect" class="form-input form-input--compact">
+        <option value="eventual">Eventual (RF/CL)</option>
+        <option value="raft">Strong (Raft)</option>
+      </select>
+    </div>
+
+    <div class="divider"></div>
+
     <div class="ctrl">
       <label>Zones/Racks <span class="val" id="racksVal">3</span></label>
       <input type="range" id="racksRange" min="1" max="3" value="3" step="1" />
@@ -383,7 +406,7 @@
       <label>Replication Factor <span class="val" id="rfVal">3</span></label>
       <input type="range" id="rfRange" min="1" max="5" value="3" step="1" />
     </div>
-    <div class="ctrl">
+    <div class="ctrl" id="clCtrl">
       <label>Consistency Level</label>
       <select id="clSelect" class="form-input form-input--compact"></select>
     </div>
@@ -525,6 +548,8 @@
     gen: 0,
     writeCounters: {},
     smartDrivers: false, // token-aware: route straight to a replica as coordinator, no proxy hop
+    mode: "eventual",    // "eventual" (RF/CL) | "raft" (per-key Raft group, majority commit)
+    raftGroups: {},      // members.join("-") -> {id, members, leader, term, entries, commitIdx}
   };
 
   // ---------- DOM refs ----------
@@ -532,7 +557,8 @@
   const nodesRange = $("nodesRange"), nodesVal = $("nodesVal");
   const racksRange = $("racksRange"), racksVal = $("racksVal");
   const rfRange = $("rfRange"), rfVal = $("rfVal");
-  const clSelect = $("clSelect");
+  const modeSelect = $("modeSelect");
+  const clSelect = $("clSelect"), clCtrl = $("clCtrl");
   const clientsRange = $("clientsRange"), clientsVal = $("clientsVal");
   const smartDriversToggle = $("smartDriversToggle");
   const keySelect = $("keySelect"), valueInput = $("valueInput");
@@ -596,6 +622,10 @@
   }
 
   function layout() {
+    // Rebuilding the stage invalidates every in-flight request: their node objects are about to
+    // be replaced, and their animations would be drawing onto coordinates that no longer exist.
+    // Bumping the generation is what makes the stale() guards throughout sendRequest fire.
+    state.gen++;
     const dims = computeLayoutDims();
     state.dims = dims;
     stageEl.setAttribute("viewBox", `0 0 ${dims.width} ${dims.height}`);
@@ -723,6 +753,13 @@
 
   function renderNodes() {
     nodesLayer.innerHTML = "";
+    // In Raft mode the selected key's group is drawn persistently — dashed outlines for the
+    // members, a "L·t<term>" pill on the leader — so which nodes a request depends on, and who
+    // currently leads them, is readable without sending anything.
+    const group = selectedKeyGroup(true);
+    const memberIdxs = group ? group.members : [];
+    const leaderIdx = group && group.leader !== null && state.nodes[group.leader] && state.nodes[group.leader].up
+      ? group.leader : null;
     state.nodes.forEach((node) => {
       const g = document.createElementNS(svgNS, "g");
       g.setAttribute("data-idx", node.idx);
@@ -732,9 +769,19 @@
       const labelY = logoY + LOGO_SIZE + 12;
       const subY = labelY + 12;
       const kvY = subY + 13;
+      const isLeader = node.idx === leaderIdx;
+      const isMember = memberIdxs.indexOf(node.idx) !== -1;
+      const raftCls = (isMember ? " raft-member" : "") + (isLeader ? " leader" : "");
+      const raftTitle = isLeader
+        ? ` — Raft LEADER for key "${keySelect.value}" at term ${group.term}`
+        : isMember ? ` — Raft group member for key "${keySelect.value}"` : "";
+      // Top-left pill: NODE_W is 92 and the 24px logo is centred, so x+4..x+32 clears it.
+      const leaderBadge = isLeader ? `
+        <rect class="node-raft-badge" x="${slotX + 4}" y="${slotY + 4}" width="28" height="13" rx="6"></rect>
+        <text class="node-raft-badge-text" x="${slotX + 18}" y="${slotY + 10.5}">L·t${group.term}</text>` : "";
       g.innerHTML = `
-        <title>${node.id} — Zone/Rack ${node.rack} — ${node.up ? "UP" : "DOWN"}</title>
-        <rect class="node-slot${node.up ? "" : " down"}" x="${slotX}" y="${slotY}" width="${NODE_W}" height="${NODE_H}" rx="9"></rect>
+        <title>${node.id} — Zone/Rack ${node.rack} — ${node.up ? "UP" : "DOWN"}${raftTitle}</title>
+        <rect class="node-slot${node.up ? "" : " down"}${raftCls}" x="${slotX}" y="${slotY}" width="${NODE_W}" height="${NODE_H}" rx="9"></rect>${leaderBadge}
         <use href="#scyllaLogo" class="node-logo${node.up ? "" : " down"}" x="${logoX}" y="${logoY}" width="${LOGO_SIZE}" height="${LOGO_SIZE}"></use>
         <text class="node-label" x="${node.x}" y="${labelY}">${node.id}</text>
         <text class="node-sub ${node.up ? "up" : "down"}" x="${node.x}" y="${subY}">${node.up ? "UP" : "DOWN"}</text>
@@ -743,6 +790,7 @@
       g.addEventListener("click", () => {
         node.up = !node.up;
         log(node.up ? "info" : "warn", `${node.id} manually set ${node.up ? "UP" : "DOWN"} by operator click`);
+        noteRaftLeaderLoss();
         renderNodes();
       });
       nodesLayer.appendChild(g);
@@ -861,6 +909,293 @@
     document.querySelectorAll(".node-slot").forEach((el) => el.classList.remove("coordinator", "replica"));
   }
 
+  // ---------- quorum waits ----------
+  // Every quorum in this simulator has the same shape: fan a batch of round trips out and stop
+  // waiting the moment enough of them have come back. Resolves with how many succeeded and
+  // whether that happened before the stragglers settled, so the log can say so.
+  function raceToQuorum(tasks, need) {
+    return new Promise((resolve) => {
+      let ok = 0, done = 0, settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve({ count: ok, early: done < tasks.length });
+      };
+      if (tasks.length === 0) { finish(); return; }
+      tasks.forEach((t) => t.then((good) => {
+        done++;
+        if (good) { ok++; if (ok >= need) finish(); }
+        if (done === tasks.length) finish();
+      }));
+    });
+  }
+
+  // ---------- raft: strong consistency ----------
+  // Models Raft the way tablets use it rather than the way group 0 does: each key's natural
+  // replicas form their own Raft group, so a group is exactly RF members and a write commits on
+  // a majority *of that group* — there is no CL left to tune. Follows scylladb/scylladb's
+  // raft/ library: pre-vote then vote elections carrying a term (fsm::become_candidate, and the
+  // "do not turn pre-voting OFF" note in raft/README.md), majority commit
+  // (tracker::committed, quorum = size / 2 + 1), commands forwarded to the leader instead of
+  // being served anywhere (raft/server.cc, not_a_leader), and a read barrier confirming
+  // leadership before a linearizable read (fsm::start_read_barrier / broadcast_read_quorum).
+  function raftQuorum(size) { return Math.floor(size / 2) + 1; }
+
+  // Votes, AppendEntries and read barriers are intra-cluster RPCs, and a single client write
+  // pays several of them in series where an eventual write pays one. Scaled down from the
+  // client-facing latency so the whole sequence stays watchable instead of turning one click
+  // into a ten-second wait.
+  const RAFT_RPC_SCALE = 0.55;
+  function raftLatency(a, b) { return randomLatency(a, b) * RAFT_RPC_SCALE; }
+
+  function raftGroupFor(replicaIdxs, create) {
+    const id = replicaIdxs.join("-");
+    let g = state.raftGroups[id];
+    if (!g && create !== false) {
+      g = state.raftGroups[id] = {
+        id,
+        members: replicaIdxs.slice(),
+        leader: null,   // node idx, or null while the group has no elected leader
+        term: 0,
+        entries: [],    // {idx, term, key, value, committed}
+        commitIdx: 0,
+      };
+    }
+    return g || null;
+  }
+
+  function raftGroupLabel(group) {
+    return group.members.map((i) => state.nodes[i].id).join(", ");
+  }
+
+  // Membership is derived from RF and the node set, so changing either invalidates every group:
+  // a term and a leader mean nothing against a different member list.
+  function resetRaftGroups() {
+    const had = Object.keys(state.raftGroups).length > 0;
+    state.raftGroups = {};
+    if (had && state.mode === "raft") {
+      log("warn", "Cluster or RF changed — Raft groups re-formed from scratch, all leaders and terms reset to 0");
+    }
+  }
+
+  // The Raft group behind whichever key is currently selected. Leadership is per group, so the
+  // leader badge on the stage tracks the key dropdown.
+  function selectedKeyGroup(create) {
+    if (state.mode !== "raft" || state.nodes.length === 0) return null;
+    const key = keySelect.value || KEYS[0];
+    const n = state.numNodes;
+    const rf = Math.min(state.rf, n);
+    return raftGroupFor(computeReplicaIdxs(tokenIndexForKey(key, n), rf, n), create);
+  }
+
+  // One RequestVote fan-out. Pre-vote runs the identical round *without* bumping the term first
+  // — that is the whole point of the extension: a candidate that cannot win never gets to raise
+  // everyone's term and depose a healthy leader on its way to losing.
+  async function raftVoteRound(group, candidate, isPrevote, quorum, stale) {
+    const others = group.members.filter((i) => i !== candidate.idx);
+    const outLabel = isPrevote ? "pre-vote?" : `vote? t${group.term}`;
+    const tasks = others.map((i) => (async () => {
+      const peer = state.nodes[i];
+      await animatePacket(candidate.x, candidate.y, peer.x, peer.y,
+        { duration: raftLatency(candidate, peer), fail: !peer.up, label: outLabel, type: "read" });
+      if (!peer.up || stale()) return false;
+      await animatePacket(peer.x, peer.y, candidate.x, candidate.y,
+        { duration: raftLatency(candidate, peer) * 0.7, fail: false, label: "granted", type: "read" });
+      return !stale();
+    })());
+    // A candidate always votes for itself, so it only has to collect quorum - 1 more.
+    const { count } = await raceToQuorum(tasks, quorum - 1);
+    return count + 1;
+  }
+
+  async function raftElect(group, stale) {
+    const size = group.members.length;
+    const quorum = raftQuorum(size);
+    const live = group.members.filter((i) => state.nodes[i].up);
+    if (live.length === 0) {
+      log("fail", `Raft group [${raftGroupLabel(group)}]: every member is down — nothing left to hold an election, the group is unavailable`);
+      return false;
+    }
+    const candidate = state.nodes[live[Math.floor(Math.random() * live.length)]];
+    log("warn", `${candidate.id}: election timeout — group [${raftGroupLabel(group)}] has no leader, starting PRE-VOTE (quorum ${quorum}/${size})`);
+
+    const preVotes = await raftVoteRound(group, candidate, true, quorum, stale);
+    if (stale()) return false;
+    if (preVotes < quorum) {
+      log("fail", `${candidate.id}: PRE-VOTE lost with ${preVotes}/${size}, needed ${quorum} — term stays at ${group.term} and the group stays leaderless. No write or read can be served.`);
+      return false;
+    }
+    group.term += 1;
+    log("info", `${candidate.id}: PRE-VOTE won ${preVotes}/${size} — bumping term to ${group.term} and calling a real election`);
+
+    const votes = await raftVoteRound(group, candidate, false, quorum, stale);
+    if (stale()) return false;
+    if (votes < quorum) {
+      log("fail", `${candidate.id}: election lost at term ${group.term} with ${votes}/${size} votes, needed ${quorum} — the group has no leader`);
+      return false;
+    }
+    group.leader = candidate.idx;
+    log("success", `${candidate.id} elected LEADER of group [${raftGroupLabel(group)}] at term ${group.term} with ${votes}/${size} votes`);
+    renderNodes();
+    return true;
+  }
+
+  // Nothing can be served without a live leader. If the previous one was killed, the group is
+  // genuinely unavailable for as long as the election takes — that pause is the price strong
+  // consistency charges, and it is the whole reason to watch this mode.
+  async function raftEnsureLeader(group, stale) {
+    if (group.leader !== null && !state.nodes[group.leader].up) {
+      log("warn", `Raft group [${raftGroupLabel(group)}]: leader ${state.nodes[group.leader].id} is down — term ${group.term} is over, an election has to run before anything can be served`);
+      group.leader = null;
+      renderNodes();
+    }
+    if (group.leader === null) {
+      // Two requests in flight shouldn't race two elections against each other and double-bump
+      // the term — the second one waits out the election already in progress instead.
+      if (!group.election) {
+        group.election = raftElect(group, stale).then(
+          (won) => { group.election = null; return won; },
+          (err) => { group.election = null; throw err; });
+      }
+      const won = await group.election;
+      if (!won || group.leader === null) return null;
+    }
+    return stale() ? null : state.nodes[group.leader];
+  }
+
+  // A group whose leader just died is leaderless until the next request triggers an election.
+  function noteRaftLeaderLoss() {
+    if (state.mode !== "raft") return;
+    Object.keys(state.raftGroups).forEach((id) => {
+      const g = state.raftGroups[id];
+      if (g.leader !== null && !state.nodes[g.leader].up) {
+        log("warn", `Raft group [${raftGroupLabel(g)}] lost leader ${state.nodes[g.leader].id} — leaderless until the next request triggers an election`);
+        g.leader = null;
+      }
+    });
+  }
+
+  async function raftRequest(type, ctx) {
+    const { client, clientAnimX, coordinator, replicaIdxs, key, value, opLabel, stale } = ctx;
+    const group = raftGroupFor(replicaIdxs, true);
+    const size = group.members.length;
+    const quorum = raftQuorum(size);
+
+    // Replies retrace the request path: a forwarded request answers back through the node the
+    // client is actually connected to, so the cost of landing off-leader stays visible.
+    async function replyToClient(ok, label, via) {
+      if (via && via.idx !== coordinator.idx) {
+        await animatePacket(via.x, via.y, coordinator.x, coordinator.y,
+          { duration: raftLatency(via, coordinator) * 0.7, fail: !ok, label, type });
+        if (stale()) return;
+      }
+      await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY,
+        { duration: 260 * SLOWDOWN, fail: !ok, label, type, insetEnd: 0 });
+    }
+
+    const leader = await raftEnsureLeader(group, stale);
+    if (stale()) return;
+    if (!leader) {
+      const live = group.members.filter((i) => state.nodes[i].up).length;
+      log("fail", `${coordinator.id} → ${client.id}: NACK (${key}) — group [${raftGroupLabel(group)}] has no leader, only ${live}/${size} members are live and a candidate needs ${quorum}. Unlike CL=ONE, a surviving minority is not allowed to answer.`);
+      await replyToClient(false, `NACK ${key}`, null);
+      return;
+    }
+
+    if (coordinator.idx !== leader.idx) {
+      log("info", `${coordinator.id}: not_a_leader — forwarding ${type.toUpperCase()} (${opLabel}) to ${leader.id}, leader for term ${group.term}`);
+      await animatePacket(coordinator.x, coordinator.y, leader.x, leader.y,
+        { duration: raftLatency(coordinator, leader), fail: false, label: `fwd ${opLabel}`, type });
+      if (stale()) return;
+    }
+
+    const followers = group.members.filter((i) => i !== leader.idx);
+
+    if (type === "write") {
+      const entry = { idx: group.entries.length + 1, term: group.term, key, value, committed: false };
+      group.entries.push(entry);
+      log("info", `${leader.id}: appended ${key}=${value} to the group log at index ${entry.idx}, term ${group.term} — replicating via AppendEntries, commit needs ${quorum}/${size}`);
+
+      const applyOn = (nodeIdx) => {
+        const nd = state.nodes[nodeIdx];
+        nd.data[key] = value;
+        renderNodeKv(nd);
+      };
+      // The leader's own persisted copy counts toward the quorum — which is exactly why a
+      // 3-member group survives one dead follower but not two.
+      const acked = [leader.idx];
+      const tasks = followers.map((i) => (async () => {
+        const peer = state.nodes[i];
+        await animatePacket(leader.x, leader.y, peer.x, peer.y,
+          { duration: raftLatency(leader, peer), fail: !peer.up, label: `AE ${key}=${value}`, type });
+        if (!peer.up) {
+          log("warn", `${leader.id}: AppendEntries to ${peer.id} went unanswered — it falls behind the leader's log and gets caught up when it returns`);
+          return false;
+        }
+        if (stale()) return false;
+        await animatePacket(peer.x, peer.y, leader.x, leader.y,
+          { duration: raftLatency(leader, peer) * 0.7, fail: false, label: `ack i${entry.idx}`, type });
+        if (stale()) return false;
+        acked.push(peer.idx);
+        // A follower that acks after the client was already answered still applies the entry
+        // once it is known committed — the ordinary catch-up path, just visible.
+        if (entry.committed) applyOn(peer.idx);
+        return true;
+      })());
+
+      const { count, early } = await raceToQuorum(tasks, quorum - 1);
+      if (stale()) return;
+      const persisted = count + 1;
+
+      if (persisted < quorum) {
+        log("fail", `${leader.id}: ${key}=${value} is stuck UNCOMMITTED at log index ${entry.idx} — only ${persisted}/${size} members persisted it, quorum is ${quorum}. Nothing is applied and the client is never told it succeeded.`);
+        await replyToClient(false, `NACK ${key}`, leader);
+        return;
+      }
+
+      entry.committed = true;
+      group.commitIdx = entry.idx;
+      acked.forEach(applyOn);
+      const earlyNote = early ? " — committed without waiting for the remaining members" : "";
+      log("success", `${leader.id}: commit index advanced to ${entry.idx} — ${key}=${value} persisted on ${persisted}/${size}, quorum ${quorum} met${earlyNote}`);
+      await replyToClient(true, `ACK ${key}=${value}`, leader);
+      if (stale()) return;
+      log("success", `${leader.id} → ${client.id}: ACK (${key}=${value}) — committed at term ${group.term}, index ${entry.idx}. Any later read is guaranteed to see it.`);
+      return;
+    }
+
+    // Linearizable read. The leader may not just answer from its own copy: a partition it has
+    // not noticed yet could already have elected someone else, which would make that copy
+    // stale. It first confirms with a quorum that it still leads this term, then reads locally.
+    // Followers never serve reads, so there is no path by which stale data reaches the client.
+    log("info", `${leader.id}: read barrier for (${opLabel}) — must hear from ${quorum}/${size} that it still leads term ${group.term} before answering`);
+    const barrierTasks = followers.map((i) => (async () => {
+      const peer = state.nodes[i];
+      await animatePacket(leader.x, leader.y, peer.x, peer.y,
+        { duration: raftLatency(leader, peer), fail: !peer.up, label: `barrier t${group.term}`, type });
+      if (!peer.up || stale()) return false;
+      await animatePacket(peer.x, peer.y, leader.x, leader.y,
+        { duration: raftLatency(leader, peer) * 0.7, fail: false, label: "still leader", type });
+      return !stale();
+    })());
+
+    const { count: barrierCount } = await raceToQuorum(barrierTasks, quorum - 1);
+    if (stale()) return;
+    const confirms = barrierCount + 1;
+
+    if (confirms < quorum) {
+      log("fail", `${leader.id}: read barrier failed at ${confirms}/${size}, quorum is ${quorum}. ${leader.id} still holds ${key}=${fmtVal(leader.data[key])} locally, but it cannot prove it is still the leader — so it refuses to serve a possibly stale read rather than risk one.`);
+      await replyToClient(false, `NACK ${key}`, leader);
+      return;
+    }
+
+    const readValue = leader.data[key];
+    log("success", `${leader.id}: read barrier confirmed at ${confirms}/${size} — serving from the leader's committed state (commit index ${group.commitIdx})`);
+    await replyToClient(true, `ACK ${key}=${fmtVal(readValue)}`, leader);
+    if (stale()) return;
+    log("success", `${leader.id} → ${client.id}: ACK (${key}=${fmtVal(readValue)}) — linearizable read, guaranteed to reflect every committed write`);
+  }
+
   // ---------- core simulation ----------
   // Mirrors the Cassandra/Scylla coordinator contract: the coordinator fails fast with
   // UNAVAILABLE if its failure detector already knows too few natural replicas are live to
@@ -927,15 +1262,31 @@
       return { replica: r, isSelf, reachable: isSelf || r.up };
     });
     const knownReachable = plan.filter((p) => p.reachable).length;
-    const readNote = type === "read" ? " [full read + digest reads]" : "";
+    const isRaft = state.mode === "raft";
+    const readNote = !isRaft && type === "read" ? " [full read + digest reads]" : "";
     const coordNote = state.smartDrivers
-      ? (forcedReplica ? " [smart driver routed directly to a replica]" : " [no live replica available, coordinator is a non-replica]")
-      : (forcedNonReplica ? " [non-token-aware: coordinator forced ≠ replica]" : " [no non-replica node available, coordinator is a replica]");
+      ? (forcedReplica
+          ? (isRaft ? " [smart driver routed straight into the group]" : " [smart driver routed directly to a replica]")
+          : (isRaft ? " [no live group member, entry point is outside the group]" : " [no live replica available, coordinator is a non-replica]"))
+      : (forcedNonReplica
+          ? (isRaft ? " [non-token-aware: entry point forced outside the group]" : " [non-token-aware: coordinator forced ≠ replica]")
+          : (isRaft ? " [no node outside the group available, entry point is a member]" : " [no non-replica node available, coordinator is a replica]"));
+    const placement = `spanning ${distinctRacks}/${state.numRacks} zones/racks`;
+    const modeNote = isRaft
+      ? `Raft group [${replicas.map((r) => r.id).join(", ")}] ${placement}, commit quorum ${raftQuorum(rf)}/${rf}`
+      : `natural replicas [${replicas.map((r) => r.id).join(", ")}] ${placement} @ CL=${state.cl} needs ${req}/${rf}`;
 
-    log("info", `${client.id} → ${coordinator.id}: ${type.toUpperCase()} (${opLabel}) coordinator, natural replicas [${replicas.map((r) => r.id).join(", ")}] spanning ${distinctRacks}/${state.numRacks} zones/racks @ CL=${state.cl} needs ${req}/${rf}${readNote}${coordNote}`);
+    log("info", `${client.id} → ${coordinator.id}: ${type.toUpperCase()} (${opLabel}) ${isRaft ? "entry point" : "coordinator"}, ${modeNote}${readNote}${coordNote}`);
 
     await animatePacket(clientAnimX, client.animY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
     if (stale()) return;
+
+    // Strong consistency takes over from here: no CL to satisfy, just a leader and a majority.
+    if (isRaft) {
+      await raftRequest(type, { client, clientAnimX, coordinator, replicaIdxs, key, value, opLabel, stale });
+      if (!stale()) setTimeout(clearHighlight, 150);
+      return;
+    }
 
     if (knownReachable < req && !anyHintFallback) {
       log("fail", `${coordinator.id}: UNAVAILABLE — only ${knownReachable}/${rf} replicas reachable, need ${req}. Rejected before contacting replicas (fail-fast).`);
@@ -985,17 +1336,8 @@
 
     // Race to quorum: resolve as soon as `req` acks land — a real coordinator does not wait
     // for the slower or unreachable replicas once CL is satisfied.
-    let ackCount = 0, decided = false, decidedEarly = false, decide;
-    const decision = new Promise((resolve) => { decide = resolve; });
-    settleTasks.forEach((p) => p.then((r) => {
-      if (r.ok) {
-        ackCount++;
-        if (!decided && ackCount >= req) { decided = true; decidedEarly = true; decide(ackCount); }
-      }
-    }));
-    Promise.all(settleTasks).then(() => { if (!decided) { decided = true; decide(ackCount); } });
-
-    const acksAtDecision = await decision;
+    const { count: acksAtDecision, early: decidedEarly } =
+      await raceToQuorum(settleTasks.map((t) => t.then((r) => r.ok)), req);
     if (stale()) return;
     const hinted = anyHintFallback && acksAtDecision === 0;
     const success = anyHintFallback ? true : acksAtDecision >= req;
@@ -1033,6 +1375,7 @@
     log(anyUp ? "warn" : "info", anyUp
       ? `Zone/Rack ${rackIdx} DOWN — nodes [${members.map((n) => n.id).join(", ")}] failed together (simulated zone/rack outage)`
       : `Zone/Rack ${rackIdx} revived — nodes [${members.map((n) => n.id).join(", ")}] back UP`);
+    noteRaftLeaderLoss();
     renderNodes();
   }
 
@@ -1045,7 +1388,21 @@
     rfRange.max = maxRf;
     if (state.rf > maxRf) { state.rf = maxRf; rfRange.value = maxRf; rfVal.textContent = maxRf; }
     refreshClOptions();
+    resetRaftGroups();
     layout();
+  }
+
+  // CL is an eventual-consistency knob with no counterpart under Raft: a group always commits on
+  // a majority of its own members, so there is nothing left to tune. Dimmed in place rather than
+  // hidden, so the fact that it stopped applying is itself part of the lesson.
+  function applyMode() {
+    const isRaft = state.mode === "raft";
+    clSelect.disabled = isRaft;
+    clCtrl.classList.toggle("is-disabled", isRaft);
+    clCtrl.title = isRaft
+      ? "Not used under strong consistency — a Raft group always commits on a majority of its members."
+      : "";
+    renderNodes();
   }
 
   racksRange.addEventListener("input", () => {
@@ -1064,6 +1421,16 @@
     state.rf = Number(rfRange.value);
     rfVal.textContent = state.rf;
     refreshClOptions();
+    resetRaftGroups();
+    renderNodes();
+  });
+
+  modeSelect.addEventListener("change", () => {
+    state.mode = modeSelect.value;
+    applyMode();
+    log("info", state.mode === "raft"
+      ? "Consistency model: STRONG (Raft). Each key's replicas form their own Raft group — one leader, majority commit, and a read barrier before every read. Consistency Level no longer applies."
+      : "Consistency model: EVENTUAL. Every replica accepts writes directly and RF/CL decides how many acks a request waits for.");
   });
 
   clSelect.addEventListener("change", () => {
@@ -1073,6 +1440,8 @@
   keySelect.addEventListener("change", () => {
     const nextVal = (state.writeCounters[keySelect.value] || 0) + 1;
     valueInput.value = nextVal;
+    // Different key, different token, so usually a different Raft group and a different leader.
+    renderNodes();
   });
 
   clientsRange.addEventListener("input", () => {
@@ -1116,6 +1485,12 @@
       target: () => document.querySelector('#rackBoxesLayer .rack-box'),
       title: "Zones/Racks",
       body: "Click a zone/rack's border to kill or revive every node in it together — a whole-zone/rack outage, not just one node.",
+      placement: "bottom",
+    },
+    {
+      target: () => document.getElementById("modeSelect"),
+      title: "Two consistency models",
+      body: "Eventual is the RF/CL world you just saw. Switch to Strong (Raft) and each key's replicas become a Raft group: one elected leader, every write committed by a majority, and a read barrier before every read. Kill the leader and watch the group stall through an election.",
       placement: "bottom",
     },
   ];
@@ -1218,7 +1593,8 @@
   });
   refreshClOptions();
   layout();
-  log("info", "Simulator ready. Send a request or kill a zone/rack to see how RF/CL determine availability.");
+  applyMode();
+  log("info", "Simulator ready. Send a request or kill a zone/rack to see how RF/CL determine availability, then switch the consistency model to Strong (Raft) to compare.");
   if (!localStorage.getItem(TOUR_SEEN_KEY)) {
     setTimeout(tourStart, 500);
   }
