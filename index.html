@@ -208,6 +208,11 @@
     color: var(--text-faint);
     padding-top: 4px;
   }
+  .page-footer a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .page-footer a:hover, .page-footer a:focus-visible { text-decoration: underline; }
 
   /* ---------- svg elements ---------- */
   .rack-box { fill: var(--surface-2); stroke-width: 2; transition: stroke .2s; }
@@ -419,7 +424,7 @@
     <div class="log-body" id="logBody"></div>
   </div>
 
-  <footer class="page-footer">Educational simulator, not 100% compatible with real ScyllaDB behavior.</footer>
+  <footer class="page-footer">Educational simulator, not 100% compatible with real ScyllaDB behavior. &middot; <a href="https://github.com/tzach/scylladb-ha-demo" target="_blank" rel="noopener noreferrer">Source on GitHub</a></footer>
 
 </div>
 
