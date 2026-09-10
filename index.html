@@ -215,7 +215,10 @@
   .page-footer a:hover, .page-footer a:focus-visible { text-decoration: underline; }
 
   /* ---------- svg elements ---------- */
-  .dc-box { fill: none; stroke: var(--text-faint); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .8; }
+  /* pointer-events:all so the whole enclosure is a click target for kill/revive — with the
+     default visiblePainted, a fill:none rect only responds on its 1.5px dashed stroke. */
+  .dc-box { fill: none; pointer-events: all; stroke: var(--text-faint); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .8; transition: stroke .2s, opacity .2s; }
+  .dc-box:hover { stroke: var(--danger); opacity: 1; }
   .dc-box-label { font-family: var(--font-mono); font-size: 11px; font-weight: 700; text-anchor: middle; letter-spacing: .08em; fill: var(--text-faint); pointer-events: none; }
 
   .rack-box { fill: var(--surface-2); stroke-width: 2; transition: stroke .2s; }
@@ -396,8 +399,12 @@
       <input type="range" id="nodesRange" min="1" max="4" value="2" step="1" />
     </div>
     <div class="ctrl">
-      <label>Replication Factor <span class="val" id="rfVal">3</span><span id="rfPerDcNote" style="display:none;"> /DC</span></label>
+      <label><span id="rfLabelText">Replication Factor</span> <span class="val" id="rfVal">3</span></label>
       <input type="range" id="rfRange" min="1" max="5" value="3" step="1" />
+    </div>
+    <div class="ctrl" id="rfDc1Ctrl" style="display:none;" title="Each datacenter gets its own replication factor, exactly like NetworkTopologyStrategy's {'DC0': n, 'DC1': m}.">
+      <label>RF DC1 <span class="val" id="rfVal1">3</span></label>
+      <input type="range" id="rfRange1" min="1" max="5" value="3" step="1" />
     </div>
     <div class="ctrl">
       <label>Consistency Level</label>
@@ -555,12 +562,13 @@
     return chosen;
   }
 
-  // Natural replicas for `key` within one datacenter, as actual node objects (not indices).
-  function replicasInDc(dcIdx, key, rfPerDc) {
+  // Natural replicas for `key` within one datacenter, as actual node objects (not indices),
+  // honouring that datacenter's own replication factor.
+  function replicasInDc(dcIdx, key) {
     const dcNodes = state.nodes.filter((nd) => nd.dc === dcIdx);
     const n = dcNodes.length;
     if (n === 0) return [];
-    const rf = Math.min(rfPerDc, n);
+    const rf = Math.min(rfForDc(dcIdx), n);
     const tokenStart = tokenIndexForKey(key, n);
     const localIdxs = computeReplicaIdxs(tokenStart, rf, dcNodes);
     return localIdxs.map((i) => dcNodes[i]);
@@ -576,24 +584,32 @@
     numNodes: 6,
     numRacks: 3,      // zones/racks PER datacenter
     nodesPerRack: 2,
-    rf: 3,            // replication factor PER datacenter (NetworkTopologyStrategy-style)
+    // Replication factor per datacenter, indexed by DC — NetworkTopologyStrategy takes an
+    // independent RF for each DC (verified against a real cluster: the stored replication map
+    // is {'DC0': n, 'DC1': m}), so these are not required to match.
+    rfByDc: [3, 3],
     cl: "QUORUM",
     numClients: 2,
     nodes: [],   // {id, idx, dc, rack, x, y, up, data}
     clients: [], // {id, x, y, dc}
-    gen: 0,
+    gen: 0,      // bumped whenever layout() rebuilds the cluster, so in-flight requests unwind
+    reqSeq: 0,
     writeCounters: {},
     smartDrivers: false, // token-aware: route straight to a replica as coordinator, no proxy hop
     stepMode: false,     // pause at each hop and wait for an explicit "Next Step" click
-    pendingStep: null,   // {resolve} for the step currently awaiting a click, or null
+    pendingStep: null,   // {reqId, resolve} for the step currently awaiting a click, or null
+    stepOwner: null,     // client id of the request currently holding the Step Mode lock
   };
+
+  function rfForDc(dc) { return state.rfByDc[dc]; }
 
   // ---------- DOM refs ----------
   const $ = (id) => document.getElementById(id);
   const multiDcToggle = $("multiDcToggle");
   const nodesRange = $("nodesRange"), nodesVal = $("nodesVal");
   const racksRange = $("racksRange"), racksVal = $("racksVal");
-  const rfRange = $("rfRange"), rfVal = $("rfVal"), rfPerDcNote = $("rfPerDcNote");
+  const rfRange = $("rfRange"), rfVal = $("rfVal"), rfLabelText = $("rfLabelText");
+  const rfRange1 = $("rfRange1"), rfVal1 = $("rfVal1"), rfDc1Ctrl = $("rfDc1Ctrl");
   const clSelect = $("clSelect");
   const clientsRange = $("clientsRange"), clientsVal = $("clientsVal");
   const smartDriversToggle = $("smartDriversToggle");
@@ -628,6 +644,11 @@
 
   function isLocalCl(cl) { return cl === "LOCAL_ONE" || cl === "LOCAL_QUORUM"; }
   function quorumOf(n) { return Math.floor(n / 2) + 1; }
+
+  // ANY and EACH_QUORUM are write-only. Reading at either level is rejected outright by the
+  // server — verified against a real ScyllaDB 6.2 cluster, which answers with
+  // InvalidRequest code=2200 "<CL> ConsistencyLevel is only supported for writes".
+  function isWriteOnlyCl(cl) { return cl === "ANY" || cl === "EACH_QUORUM"; }
 
   // Per-datacenter ack requirement, used both for LOCAL_* (against the local DC's RF) and for
   // EACH_QUORUM (against every DC's RF independently).
@@ -695,6 +716,13 @@
   }
 
   function layout() {
+    // Any request still in flight holds references to the node objects we're about to replace.
+    // Bumping the generation makes those requests unwind at their next checkpoint instead of
+    // applying writes into orphaned nodes; releasing the step pause lets a paused one get there.
+    state.gen++;
+    resolvePendingStep();
+    state.stepOwner = null;
+
     const dims = computeLayoutDims();
     state.dims = dims;
     stageEl.setAttribute("viewBox", `0 0 ${dims.width} ${dims.height}`);
@@ -837,8 +865,8 @@
       fo.setAttribute("height", CLIENT_BTN_SIZE);
       fo.innerHTML = `
         <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex; justify-content:center; align-items:center; gap:${CLIENT_BTN_GAP}px; width:100%; height:100%;">
-          <button type="button" class="btn btn--fab btn--secondary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}</button>
-          <button type="button" class="btn btn--fab btn--primary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}</button>
+          <button type="button" class="btn btn--fab btn--secondary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send write from ${c.id}" data-title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}</button>
+          <button type="button" class="btn btn--fab btn--primary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send read from ${c.id}" data-title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}</button>
         </div>
       `;
       const [writeBtn, readBtn] = fo.querySelectorAll("button");
@@ -847,6 +875,7 @@
       g.appendChild(fo);
       clientsLayer.appendChild(g);
     });
+    updateClientButtons(); // freshly rendered buttons must respect an active Step Mode lock
 
     renderNodes();
   }
@@ -1018,8 +1047,22 @@
 
   // ---------- step control ----------
   // When Step Mode is on, a request pauses at each major hop and waits for an explicit "Next
-  // Step" click instead of animating straight through. Only one step is ever pending at a time
-  // (the UI serializes clicks onto whichever request is currently paused).
+  // Step" click instead of animating straight through. There is exactly one "Next Step" button,
+  // so a stepped request takes a lock for its whole lifetime: a second request would otherwise
+  // claim the button and strand the first one mid-flight, half-applied and never cleaned up.
+  function stepLocked() { return state.stepMode && state.stepOwner !== null; }
+
+  function updateClientButtons() {
+    const locked = stepLocked();
+    clientsLayer.querySelectorAll("button").forEach((b) => {
+      b.disabled = locked;
+      // A dimmed button with no explanation is a dead end — say why it's unavailable.
+      b.title = locked
+        ? `Step Mode: ${state.stepOwner}'s request is mid-flight — advance it with "Next Step ▶" (or turn Step Mode off)`
+        : b.dataset.title;
+    });
+  }
+
   function resolvePendingStep() {
     if (state.pendingStep) {
       const resolve = state.pendingStep.resolve;
@@ -1030,14 +1073,25 @@
     }
   }
 
-  function awaitStep(desc) {
+  function awaitStep(reqId, ownerId, desc) {
     if (!state.stepMode) return Promise.resolve();
     return new Promise((resolve) => {
-      state.pendingStep = { resolve };
+      state.pendingStep = { reqId, resolve };
+      state.stepOwner = ownerId;
+      updateClientButtons();
       btnNextStep.disabled = false;
       stepStatusText.textContent = desc;
       log("info", `⏸ ${desc} — click "Next Step ▶" to continue`);
     });
+  }
+
+  // Called when a request finishes or unwinds, so the next one can start.
+  function releaseStepLock(reqId, ownerId) {
+    if (state.pendingStep && state.pendingStep.reqId === reqId) resolvePendingStep();
+    if (state.stepOwner === ownerId) {
+      state.stepOwner = null;
+      updateClientButtons();
+    }
   }
 
   // ---------- core simulation ----------
@@ -1049,13 +1103,29 @@
   // without waiting for the rest. The client gets back an ACK carrying the value on success,
   // or a NACK on any failure path.
   //
-  // Multi-DC awareness: LOCAL_ONE/LOCAL_QUORUM only ever build a plan out of the client's local
+  // Multi-DC awareness: LOCAL_ONE/LOCAL_QUORUM only ever build a plan out of the COORDINATOR's
   // datacenter's natural replicas (the remote DC is never contacted). EACH_QUORUM builds a plan
   // out of every DC's replicas but requires an independent quorum in every DC. Every other level
   // (ANY/ONE/QUORUM/ALL) builds a plan out of every DC's replicas and counts acks cluster-wide.
   async function sendRequest(type, client) {
+    // Step Mode serializes requests — see stepLocked().
+    if (stepLocked()) {
+      log("warn", `Step Mode: ${state.stepOwner}'s request is still in flight — finish it with "Next Step ▶" (or turn Step Mode off) before sending another`);
+      return;
+    }
+
     const myGen = state.gen;
     const stale = () => state.gen !== myGen;
+    const reqId = ++state.reqSeq;
+    try {
+      await runRequest(type, client, reqId, myGen, stale);
+    } finally {
+      releaseStepLock(reqId, client.id);
+      if (stale()) clearHighlight();
+    }
+  }
+
+  async function runRequest(type, client, reqId, myGen, stale) {
     // Message lines start from whichever icon was actually clicked — the pencil for a write,
     // the eye for a read — rather than a neutral point between them.
     const clientAnimX = type === "write" ? client.writeX : client.readX;
@@ -1081,11 +1151,42 @@
     const cl = state.cl;
     const localScope = isLocalCl(cl);
     const eachScope = cl === "EACH_QUORUM";
-    // Which DCs are actually part of this request's plan.
-    const dcsInvolved = localScope ? [client.dc] : Array.from({ length: state.numDcs }, (_, i) => i);
+
+    // The driver's view of the ring: natural replicas in EVERY datacenter. Token-aware routing
+    // picks a coordinator out of this full set; the request's CL scope narrows it further below.
+    const allReplicasByDc = {};
+    for (let dc = 0; dc < state.numDcs; dc++) allReplicasByDc[dc] = replicasInDc(dc, key);
+    const allReplicaIdxSet = new Set(Object.values(allReplicasByDc).flat().map((r) => r.idx));
+
+    // DC-aware load balancing: the driver only ever hands the request to a node in its own local
+    // datacenter. Modern drivers default to zero remote hosts, so a dead local DC surfaces as a
+    // client-side NoHostAvailable rather than a silent failover into the remote datacenter.
+    const localDcUp = upNodes.filter((nd) => nd.dc === client.dc);
+    if (state.numDcs > 1 && localDcUp.length === 0) {
+      log("fail", `${client.id}: NoHostAvailable — no live node in DC${client.dc}, the client's local datacenter. A DC-aware driver policy does not fail over to remote DCs.`);
+      return;
+    }
+    const basePool = localDcUp.length > 0 ? localDcUp : upNodes;
+    let coordinatorPool = basePool;
+    let forcedReplica = false;
+    let forcedNonReplica = false;
+    if (state.smartDrivers) {
+      const replicaUp = basePool.filter((nd) => allReplicaIdxSet.has(nd.idx));
+      if (replicaUp.length > 0) { coordinatorPool = replicaUp; forcedReplica = true; }
+    } else {
+      const nonReplicaUp = basePool.filter((nd) => !allReplicaIdxSet.has(nd.idx));
+      if (nonReplicaUp.length > 0) { coordinatorPool = nonReplicaUp; forcedNonReplica = true; }
+    }
+    const coordinator = coordinatorPool[Math.floor(Math.random() * coordinatorPool.length)];
+
+    // "Local" means the COORDINATOR's datacenter, not the client's — verified against a real
+    // 2-DC cluster: with the client's DC fully down and the coordinator pinned to the other DC,
+    // LOCAL_QUORUM and LOCAL_ONE both still succeed against the coordinator's own DC.
+    const localDc = coordinator.dc;
+    const dcsInvolved = localScope ? [localDc] : Array.from({ length: state.numDcs }, (_, i) => i);
 
     const replicasByDc = {};
-    dcsInvolved.forEach((dc) => { replicasByDc[dc] = replicasInDc(dc, key, state.rf); });
+    dcsInvolved.forEach((dc) => { replicasByDc[dc] = allReplicasByDc[dc]; });
     const replicas = dcsInvolved.flatMap((dc) => replicasByDc[dc]);
     const replicaIdxSet = new Set(replicas.map((r) => r.idx));
     const dcSpanNote = dcsInvolved
@@ -1111,28 +1212,6 @@
     const anyHintFallback = cl === "ANY" && type === "write";
     const rfTotal = replicas.length;
 
-    // DC-aware coordinator routing: prefer a live node in the client's own local DC (mirrors a
-    // real DCAwareRoundRobinPolicy) before falling back to any live node cluster-wide. A smart
-    // (token-aware) driver additionally routes straight to a natural replica as coordinator,
-    // skipping the extra proxy hop; a non-token-aware driver is forced onto a non-replica so
-    // every replica hop is a real network round trip.
-    const localDcUp = upNodes.filter((nd) => nd.dc === client.dc);
-    const basePool = localDcUp.length > 0 ? localDcUp : upNodes;
-    let coordinatorPool = basePool;
-    let forcedReplica = false;
-    let forcedNonReplica = false;
-    let crossDcCoordinator = localDcUp.length === 0 && state.numDcs > 1;
-    if (state.smartDrivers) {
-      let replicaUp = basePool.filter((nd) => replicaIdxSet.has(nd.idx));
-      if (replicaUp.length === 0) replicaUp = upNodes.filter((nd) => replicaIdxSet.has(nd.idx));
-      if (replicaUp.length > 0) { coordinatorPool = replicaUp; forcedReplica = true; }
-    } else {
-      const nonReplicaUp = basePool.filter((nd) => !replicaIdxSet.has(nd.idx));
-      if (nonReplicaUp.length > 0) { coordinatorPool = nonReplicaUp; forcedNonReplica = true; }
-    }
-    if (coordinatorPool.length === 0) coordinatorPool = upNodes;
-    const coordinator = coordinatorPool[Math.floor(Math.random() * coordinatorPool.length)];
-
     highlightCoordinatorAndReplicas(coordinator, [...replicaIdxSet]);
 
     // What the coordinator's failure detector already believes, before sending a single message.
@@ -1148,17 +1227,29 @@
     const coordNote = state.smartDrivers
       ? (forcedReplica ? " [smart driver routed directly to a replica]" : " [no live replica available, coordinator is a non-replica]")
       : (forcedNonReplica ? " [non-token-aware: coordinator forced ≠ replica]" : " [no non-replica node available, coordinator is a replica]");
-    const dcNote = state.numDcs > 1 ? ` [client local=DC${client.dc}, coordinator=DC${coordinator.dc}${crossDcCoordinator ? ", no live node in local DC!" : ""}]` : "";
+    const dcNote = state.numDcs > 1
+      ? ` [coordinator in DC${localDc}${localScope ? `, so LOCAL_* scope = DC${localDc}` : ""}]`
+      : "";
     const needNote = eachScope
       ? dcsInvolved.map((dc) => `DC${dc} ${perDcNeed[dc]}/${replicasByDc[dc].length}`).join(", ")
       : `${need}/${rfTotal}`;
 
     log("info", `${client.id} → ${coordinator.id}: ${type.toUpperCase()} (${opLabel}) coordinator, natural replicas [${replicas.map((r) => r.id).join(", ")}] (${dcSpanNote}) @ CL=${cl} needs ${needNote}${readNote}${coordNote}${dcNote}`);
 
-    await awaitStep(`Step 1/3 — ${client.id} → ${coordinator.id}: send ${type.toUpperCase()} (${opLabel})`);
+    await awaitStep(reqId, client.id, `Step 1/3 — ${client.id} → ${coordinator.id}: send ${type.toUpperCase()} (${opLabel})`);
     if (stale()) return;
     await animatePacket(clientAnimX, client.animY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
     if (stale()) return;
+
+    // ANY and EACH_QUORUM are write-only: the coordinator rejects the query outright before it
+    // ever looks at replicas. Wording matches what a real ScyllaDB 6.2 coordinator returns.
+    if (type === "read" && isWriteOnlyCl(cl)) {
+      log("fail", `${coordinator.id}: InvalidRequest (code=2200) — "${cl} ConsistencyLevel is only supported for writes". Query rejected; no replicas contacted.`);
+      log("fail", `${coordinator.id} → ${client.id}: ERROR (${key})`);
+      await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 220 * SLOWDOWN, fail: true, label: "InvalidRequest", type, insetEnd: 0 });
+      clearHighlight();
+      return;
+    }
 
     const failFast = eachScope
       ? dcsInvolved.some((dc) => knownReachableByDc[dc] < perDcNeed[dc])
@@ -1171,11 +1262,10 @@
       log("fail", `${coordinator.id} → ${client.id}: NACK (${key})`);
       await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 220 * SLOWDOWN, fail: true, label: `NACK ${key}`, type, insetEnd: 0 });
       clearHighlight();
-      resolvePendingStep();
       return;
     }
 
-    await awaitStep(`Step 2/3 — ${coordinator.id} fans out to ${plan.filter((p) => p.reachable).length} replica(s)`);
+    await awaitStep(reqId, client.id, `Step 2/3 — ${coordinator.id} fans out to ${plan.filter((p) => p.reachable).length} replica(s)`);
     if (stale()) return;
 
     // Which contacted replica serves the full read: the coordinator's own local copy if it's a
@@ -1251,7 +1341,7 @@
 
     const replyLabel = !success ? `NACK ${key}` : type === "write" ? `ACK ${key}=${value}` : `ACK ${key}=${fmtVal(readValue)}`;
 
-    await awaitStep(`Step 3/3 — ${coordinator.id} → ${client.id}: reply with ${success ? "ACK" : "NACK"}`);
+    await awaitStep(reqId, client.id, `Step 3/3 — ${coordinator.id} → ${client.id}: reply with ${success ? "ACK" : "NACK"}`);
     if (stale()) return;
     await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 260 * SLOWDOWN, fail: !success, label: replyLabel, type, insetEnd: 0 });
     if (stale()) return;
@@ -1269,7 +1359,6 @@
       log("fail", `${coordinator.id} → ${client.id}: NACK (${key}) — CL=${cl} not met within the timeout (${metNote} acks needed)`);
     }
 
-    resolvePendingStep();
     Promise.all(settleTasks).then(() => setTimeout(clearHighlight, 150));
   }
 
@@ -1305,20 +1394,28 @@
   // ---------- wiring ----------
   // Recompute the derived total node count whenever zones or nodes-per-zone change, and clamp
   // RF (which can't exceed the node count) to match.
-  // RF is applied PER datacenter (like NetworkTopologyStrategy), so its max is capped by the
-  // node count within a single DC, not the cluster-wide total.
+  // RF is applied PER datacenter (like NetworkTopologyStrategy), so each DC's slider is capped
+  // by the node count within a single DC, not the cluster-wide total.
   function applyNodeCount() {
     const nodesPerDc = state.numRacks * state.nodesPerRack;
     const maxRf = Math.min(5, nodesPerDc);
-    rfRange.max = maxRf;
-    if (state.rf > maxRf) { state.rf = maxRf; rfRange.value = maxRf; rfVal.textContent = maxRf; }
+    [[rfRange, rfVal, 0], [rfRange1, rfVal1, 1]].forEach(([range, valEl, dc]) => {
+      range.max = maxRf;
+      if (state.rfByDc[dc] > maxRf) {
+        state.rfByDc[dc] = maxRf;
+        range.value = maxRf;
+        valEl.textContent = maxRf;
+      }
+    });
     refreshClOptions();
     layout();
   }
 
   multiDcToggle.addEventListener("change", () => {
     state.numDcs = multiDcToggle.checked ? 2 : 1;
-    rfPerDcNote.style.display = state.numDcs > 1 ? "" : "none";
+    const multi = state.numDcs > 1;
+    rfDc1Ctrl.style.display = multi ? "" : "none";
+    rfLabelText.textContent = multi ? "RF DC0" : "Replication Factor";
     applyNodeCount();
   });
 
@@ -1335,8 +1432,14 @@
   });
 
   rfRange.addEventListener("input", () => {
-    state.rf = Number(rfRange.value);
-    rfVal.textContent = state.rf;
+    state.rfByDc[0] = Number(rfRange.value);
+    rfVal.textContent = state.rfByDc[0];
+    refreshClOptions();
+  });
+
+  rfRange1.addEventListener("input", () => {
+    state.rfByDc[1] = Number(rfRange1.value);
+    rfVal1.textContent = state.rfByDc[1];
     refreshClOptions();
   });
 
@@ -1347,7 +1450,10 @@
   stepModeToggle.addEventListener("change", () => {
     state.stepMode = stepModeToggle.checked;
     stepStatusCtrl.style.display = state.stepMode ? "" : "none";
-    if (!state.stepMode) resolvePendingStep(); // don't leave a request stuck waiting forever
+    // Turning Step Mode off mid-request must not strand it: release the pause so it runs to
+    // completion on its own, and drop the lock so the clients are clickable again.
+    if (!state.stepMode) resolvePendingStep();
+    updateClientButtons();
   });
 
   btnNextStep.addEventListener("click", () => resolvePendingStep());
@@ -1377,13 +1483,13 @@
   const TOUR_SEEN_KEY = "scylladb-ha-tour-seen";
   const tourSteps = [
     {
-      target: () => document.querySelector('#clientsLayer button[title^="Send write"]'),
+      target: () => document.querySelector('#clientsLayer button[data-title^="Send write"]'),
       title: "Send a write",
       body: "Each client can act on its own. Click the pencil to write the next value for the selected key from that client.",
       placement: "right",
     },
     {
-      target: () => document.querySelector('#clientsLayer button[title^="Send read"]'),
+      target: () => document.querySelector('#clientsLayer button[data-title^="Send read"]'),
       title: "Send a read",
       body: "Click the eye to read the current value of the selected key from that client.",
       placement: "right",
