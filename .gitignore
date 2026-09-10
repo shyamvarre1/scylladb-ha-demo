@@ -3,3 +3,4 @@
 
 # Local-only Claude Code tool permissions, not meant to be shared
 .claude/settings.local.json
+.DS_Store

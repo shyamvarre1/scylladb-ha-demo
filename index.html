@@ -181,7 +181,7 @@
     font-size: 12px;
     padding-right: 10px;
     display: flex;
-    flex-direction: column-reverse;
+    flex-direction: column;
   }
   .log-line {
     padding: 3px 0;
@@ -215,6 +215,12 @@
   .page-footer a:hover, .page-footer a:focus-visible { text-decoration: underline; }
 
   /* ---------- svg elements ---------- */
+  /* pointer-events:all so the whole enclosure is a click target for kill/revive — with the
+     default visiblePainted, a fill:none rect only responds on its 1.5px dashed stroke. */
+  .dc-box { fill: none; pointer-events: all; stroke: var(--text-faint); stroke-width: 1.5; stroke-dasharray: 3 4; opacity: .8; transition: stroke .2s, opacity .2s; }
+  .dc-box:hover { stroke: var(--danger); opacity: 1; }
+  .dc-box-label { font-family: var(--font-mono); font-size: 11px; font-weight: 700; text-anchor: middle; letter-spacing: .08em; fill: var(--text-faint); pointer-events: none; }
+
   .rack-box { fill: var(--surface-2); stroke-width: 2; transition: stroke .2s; }
   .rack-box-label { font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; text-anchor: middle; letter-spacing: .04em; pointer-events: none; }
 
@@ -233,6 +239,7 @@
 
   .client-box { fill: var(--surface-2); stroke: var(--client); stroke-width: 2; cursor: default; }
   .client-label { fill: var(--client); font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; pointer-events: none; }
+  .client-dc-badge { fill: var(--text-dim); font-family: var(--font-mono); font-size: 9px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; letter-spacing: .02em; }
 
   .msg-line { fill: none; stroke-width: 1.5; opacity: .55; }
   .msg-line.ok { stroke: var(--ok); }
@@ -376,6 +383,13 @@
   </div>
 
   <div class="controls">
+    <div class="ctrl toggle-row" style="min-width:auto;" title="When on, the cluster is split into 2 datacenters (each with its own zones/racks and nodes), so you can see LOCAL_* and EACH_QUORUM consistency levels in action.">
+      <label class="toggle">
+        <input type="checkbox" id="multiDcToggle" />
+        <span class="toggle-track"></span>
+        <span class="choice-label" style="font-size:12.5px; color:var(--text-dim); font-weight:400;">Multi-DC (2 DCs)</span>
+      </label>
+    </div>
     <div class="ctrl">
       <label>Zones/Racks <span class="val" id="racksVal">3</span></label>
       <input type="range" id="racksRange" min="1" max="3" value="3" step="1" />
@@ -385,8 +399,12 @@
       <input type="range" id="nodesRange" min="1" max="4" value="2" step="1" />
     </div>
     <div class="ctrl">
-      <label>Replication Factor <span class="val" id="rfVal">3</span></label>
+      <label><span id="rfLabelText">Replication Factor</span> <span class="val" id="rfVal">3</span></label>
       <input type="range" id="rfRange" min="1" max="5" value="3" step="1" />
+    </div>
+    <div class="ctrl" id="rfDc1Ctrl" style="display:none;" title="Each datacenter gets its own replication factor, exactly like NetworkTopologyStrategy's {'DC0': n, 'DC1': m}.">
+      <label>RF DC1 <span class="val" id="rfVal1">3</span></label>
+      <input type="range" id="rfRange1" min="1" max="5" value="3" step="1" />
     </div>
     <div class="ctrl">
       <label>Consistency Level</label>
@@ -413,6 +431,24 @@
     <div class="ctrl">
       <label>Value <span style="font-weight:400; text-transform:none; letter-spacing:0;">(auto-increments)</span></label>
       <input type="number" id="valueInput" min="0" max="999" value="1" class="form-input form-input--compact" style="width:70px; font-family:var(--font-mono);" />
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="ctrl toggle-row" style="min-width:auto;" title="When on, each request pauses at each hop (client→coordinator, coordinator→replicas, replicas→coordinator, coordinator→client) so you can inspect exactly what's in flight before advancing.">
+      <label class="toggle">
+        <input type="checkbox" id="stepModeToggle" />
+        <span class="toggle-track"></span>
+        <span class="choice-label" style="font-size:12.5px; color:var(--text-dim); font-weight:400;">Step Mode</span>
+      </label>
+    </div>
+    <div class="ctrl" style="min-width:auto;">
+      <label>&nbsp;</label>
+      <button type="button" class="btn btn--xs btn--primary" id="btnNextStep" disabled>Next Step ▶</button>
+    </div>
+    <div class="ctrl" id="stepStatusCtrl" style="min-width:220px; display:none;">
+      <label>Current Step</label>
+      <div id="stepStatusText" style="font-family:var(--font-mono); font-size:11.5px; color:var(--text-dim);">—</div>
     </div>
   </div>
 
@@ -448,24 +484,45 @@
   const RACK_GAP = 64;      // gap between adjacent racks — kept wide so groups don't crowd
   const CLIENT_MARGIN = 60; // gap between the client column and the first rack
   const STAGE_PAD = 18;
+  const DC_GAP = 96;        // gap between adjacent datacenter super-groups — must comfortably
+                            // exceed RACK_GAP, otherwise racks inside a DC sit further apart
+                            // than the DCs themselves and the grouping reads backwards
+  const DC_PAD_X = 14;      // clearance between a DC's border and its outermost rack boxes
+  const DC_PAD_BOTTOM = 14; // matching clearance below the bottom rack edge (the top side gets
+                            // DC_LABEL_H instead, which is that plus room for the DC label)
+  const DC_LABEL_H = 20;    // extra headroom above each DC's rack boxes for its own label
 
-  // Each client is a small card with its own round Write/Read icon buttons — request always
+  // Each client is a small card with its own Write/Read pill buttons — request always
   // originates from a specific client, not a random pick, so it's obvious which one issued it.
+  // The pills are stacked one per row at full card width rather than side by side: spelling the
+  // words out doubles a button's width, and two of those in a row would make each client card
+  // wider than a whole rack column, so the client tier would read as the main subject of the
+  // diagram instead of the cluster. Stacked, the card stays its original ~75 units wide.
   const CLIENT_PAD = 6;
   const CLIENT_LABEL_H = 18;
-  const CLIENT_BTN_SIZE = 28;
-  const CLIENT_BTN_GAP = 8;   // horizontal gap between the two round buttons
-  const CLIENT_ROW_GAP = 6;   // vertical gap between the label and the button row
-  const CLIENT_W = CLIENT_PAD * 2 + CLIENT_BTN_SIZE * 2 + CLIENT_BTN_GAP;
-  const CLIENT_CARD_H = CLIENT_PAD * 2 + CLIENT_LABEL_H + CLIENT_ROW_GAP + CLIENT_BTN_SIZE;
+  const CLIENT_BTN_H = 22;    // pill height
+  const CLIENT_BTN_W = 62;    // pill width — sized for the icon plus the longer of the two words
+  const CLIENT_BTN_FS = 11;   // pill label size, in step with .client-label's 10.5px
+  const CLIENT_BTN_GAP = 6;   // vertical gap between the two stacked pills
+  const CLIENT_ROW_GAP = 6;   // vertical gap between the label and the button block
+  const CLIENT_W = CLIENT_PAD * 2 + CLIENT_BTN_W;
+  const CLIENT_DC_ROW_H = 16; // extra row for the "local DC" badge, only shown when numDcs > 1
+  const CLIENT_BTNS_H = CLIENT_BTN_H * 2 + CLIENT_BTN_GAP;
+  const CLIENT_CARD_H_BASE = CLIENT_PAD * 2 + CLIENT_LABEL_H + CLIENT_ROW_GAP + CLIENT_BTNS_H;
   const CLIENT_STACK_GAP = 18; // vertical gap between stacked client cards
-  // The label above the buttons pushes their row below the card's true geometric center — this
-  // offset re-centers a client's message lines on the button row itself, not the whole card.
-  const CLIENT_ANIM_Y_OFFSET = CLIENT_PAD + CLIENT_LABEL_H + CLIENT_ROW_GAP + CLIENT_BTN_SIZE / 2 - CLIENT_CARD_H / 2;
-  // The write (pencil) and read (eye) buttons sit side by side with no slack in the row — its
-  // width is exactly 2 buttons + the gap — so each button's center is this far from the card's
-  // horizontal center, symmetric left/right.
-  const CLIENT_ICON_X_OFFSET = (CLIENT_BTN_SIZE + CLIENT_BTN_GAP) / 2;
+  // Card height grows by one row when the "local DC" badge is shown (multi-DC mode).
+  function clientCardH() { return CLIENT_CARD_H_BASE + (state.numDcs > 1 ? CLIENT_DC_ROW_H : 0); }
+  // Distance from the top of a client card down to the top of its button block — the label, and
+  // the DC badge when it's shown, sit above it.
+  function clientBtnsTopOffset() {
+    return CLIENT_PAD + CLIENT_LABEL_H + (state.numDcs > 1 ? CLIENT_DC_ROW_H : 0) + CLIENT_ROW_GAP;
+  }
+  // The buttons are stacked, so a request's message lines leave from the vertical center of
+  // whichever pill was pressed rather than from the card's own (higher) geometric center.
+  function clientAnimYOffset(type) {
+    const row = type === "write" ? 0 : 1;
+    return clientBtnsTopOffset() + row * (CLIENT_BTN_H + CLIENT_BTN_GAP) + CLIENT_BTN_H / 2 - clientCardH() / 2;
+  }
 
   function fmtVal(v) { return v === undefined ? "∅" : v; }
 
@@ -494,13 +551,17 @@
   // Rack-aware replica placement, same spirit as NetworkTopologyStrategy: walk the ring
   // clockwise from the token and prefer nodes from racks not yet represented, only doubling
   // up on a rack once every rack has at least one replica (or RF exceeds the rack count).
-  function computeReplicaIdxs(tokenStart, rf, n) {
+  // `nodesArr` is the ring to walk — for multi-DC clusters this is one datacenter's nodes only
+  // (each DC keeps its own independent token ring, NetworkTopologyStrategy-style), so returned
+  // indices are local to `nodesArr`, not the global state.nodes array.
+  function computeReplicaIdxs(tokenStart, rf, nodesArr) {
+    const n = nodesArr.length;
     const chosen = [];
     const usedRacks = new Set();
     const fallback = [];
     for (let step = 0; step < n && chosen.length < rf; step++) {
       const idx = (tokenStart + step) % n;
-      const rack = state.nodes[idx].rack;
+      const rack = nodesArr[idx].rack;
       if (!usedRacks.has(rack)) {
         chosen.push(idx);
         usedRacks.add(rack);
@@ -513,57 +574,119 @@
     return chosen;
   }
 
+  // Natural replicas for `key` within one datacenter, as actual node objects (not indices),
+  // honouring that datacenter's own replication factor.
+  function replicasInDc(dcIdx, key) {
+    const dcNodes = state.nodes.filter((nd) => nd.dc === dcIdx);
+    const n = dcNodes.length;
+    if (n === 0) return [];
+    const rf = Math.min(rfForDc(dcIdx), n);
+    const tokenStart = tokenIndexForKey(key, n);
+    const localIdxs = computeReplicaIdxs(tokenStart, rf, dcNodes);
+    return localIdxs.map((i) => dcNodes[i]);
+  }
+
   // ScyllaDB DS chart tokens (--chart-1..--chart-8) — theme-reactive categorical colors,
   // so rack coloring stays on-brand and adapts automatically across light/dark/scylla.
-  const RACK_CHART_VARS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8"];
+  // --chart-3, --chart-4 and --chart-6 are deliberately left out: in every theme they alias
+  // warning-*, success-* and error-* respectively, which are the semantic status colors used
+  // for node UP, WARN and failed messages. A purely decorative rack border in one of those
+  // reads as a rack stuck in a warning/failed/healthy state, so the ramp skips them.
+  // Ordered widest-hue-gap first (blue 234 / violet 293 / magenta 357) so that the racks actually
+  // on screen stay easy to tell apart — --chart-5 is a near-twin of --chart-1 and sits last.
+  const RACK_CHART_VARS = ["--chart-1", "--chart-2", "--chart-7", "--chart-8", "--chart-5"];
   function rackColor(rackIdx) { return `var(${RACK_CHART_VARS[rackIdx % RACK_CHART_VARS.length]})`; }
 
   const state = {
+    numDcs: 1,        // 1 or 2 — with 2, the cluster is split into independent datacenters
     numNodes: 6,
-    numRacks: 3,
+    numRacks: 3,      // zones/racks PER datacenter
     nodesPerRack: 2,
-    rf: 3,
+    // Replication factor per datacenter, indexed by DC — NetworkTopologyStrategy takes an
+    // independent RF for each DC (verified against a real cluster: the stored replication map
+    // is {'DC0': n, 'DC1': m}), so these are not required to match.
+    rfByDc: [3, 3],
     cl: "QUORUM",
     numClients: 2,
-    nodes: [],   // {id, idx, x, y, up, rack}
-    clients: [], // {id, x, y}
-    gen: 0,
+    nodes: [],   // {id, idx, dc, rack, x, y, up, data}
+    clients: [], // {id, x, y, dc}
+    gen: 0,      // bumped whenever layout() rebuilds the cluster, so in-flight requests unwind
+    reqSeq: 0,
     writeCounters: {},
     smartDrivers: false, // token-aware: route straight to a replica as coordinator, no proxy hop
+    stepMode: false,     // pause at each hop and wait for an explicit "Next Step" click
+    pendingStep: null,   // {reqId, resolve} for the step currently awaiting a click, or null
+    stepOwner: null,     // client id of the request currently holding the Step Mode lock
   };
+
+  function rfForDc(dc) { return state.rfByDc[dc]; }
 
   // ---------- DOM refs ----------
   const $ = (id) => document.getElementById(id);
+  const multiDcToggle = $("multiDcToggle");
   const nodesRange = $("nodesRange"), nodesVal = $("nodesVal");
   const racksRange = $("racksRange"), racksVal = $("racksVal");
-  const rfRange = $("rfRange"), rfVal = $("rfVal");
+  const rfRange = $("rfRange"), rfVal = $("rfVal"), rfLabelText = $("rfLabelText");
+  const rfRange1 = $("rfRange1"), rfVal1 = $("rfVal1"), rfDc1Ctrl = $("rfDc1Ctrl");
   const clSelect = $("clSelect");
   const clientsRange = $("clientsRange"), clientsVal = $("clientsVal");
   const smartDriversToggle = $("smartDriversToggle");
   const keySelect = $("keySelect"), valueInput = $("valueInput");
   const btnClearLog = $("btnClearLog");
   const btnShowTour = $("btnShowTour");
+  const stepModeToggle = $("stepModeToggle");
+  const btnNextStep = $("btnNextStep");
+  const stepStatusCtrl = $("stepStatusCtrl"), stepStatusText = $("stepStatusText");
   const stageEl = $("stage");
   const nodesLayer = $("nodesLayer"), clientsLayer = $("clientsLayer"),
         messagesLayer = $("messagesLayer"), rackBoxesLayer = $("rackBoxesLayer");
   const logBody = $("logBody");
 
   // ---------- consistency levels ----------
+  // ANY/ONE/QUORUM/ALL are cluster-wide (they count acks from replicas in every datacenter).
+  // LOCAL_ONE/LOCAL_QUORUM only ever contact replicas in the request's local datacenter — the
+  // remote DC's replicas aren't touched at all on the request path (real Cassandra/Scylla
+  // behavior; the remote DC only catches up via normal replication/hinted handoff).
+  // EACH_QUORUM contacts replicas in every DC and requires an independent quorum in each one.
   function clOptionsFor() {
     return [
       { v: "ANY", label: "ANY" },
       { v: "ONE", label: "ONE" },
       { v: "QUORUM", label: "QUORUM" },
       { v: "ALL", label: "ALL" },
+      { v: "LOCAL_ONE", label: "LOCAL_ONE" },
+      { v: "LOCAL_QUORUM", label: "LOCAL_QUORUM" },
+      { v: "EACH_QUORUM", label: "EACH_QUORUM" },
     ];
   }
 
-  function requiredAcks(cl, rf) {
+  function isLocalCl(cl) { return cl === "LOCAL_ONE" || cl === "LOCAL_QUORUM"; }
+  function quorumOf(n) { return Math.floor(n / 2) + 1; }
+
+  // ANY and EACH_QUORUM are write-only. Reading at either level is rejected outright by the
+  // server — verified against a real ScyllaDB 6.2 cluster, which answers with
+  // InvalidRequest code=2200 "<CL> ConsistencyLevel is only supported for writes".
+  function isWriteOnlyCl(cl) { return cl === "ANY" || cl === "EACH_QUORUM"; }
+
+  // Per-datacenter ack requirement, used both for LOCAL_* (against the local DC's RF) and for
+  // EACH_QUORUM (against every DC's RF independently).
+  function requiredAcksLocal(cl, rfPerDc) {
+    switch (cl) {
+      case "LOCAL_ONE": return 1;
+      case "LOCAL_QUORUM": return quorumOf(rfPerDc);
+      case "EACH_QUORUM": return quorumOf(rfPerDc);
+      default: return 1;
+    }
+  }
+
+  // Cluster-wide ack requirement for the non-local, non-EACH_QUORUM levels, against total RF
+  // summed across every datacenter involved (== rfPerDc when there's only 1 DC).
+  function requiredAcksTotal(cl, totalRf) {
     switch (cl) {
       case "ANY": return 1;
       case "ONE": return 1;
-      case "QUORUM": return Math.floor(rf / 2) + 1;
-      case "ALL": return rf;
+      case "QUORUM": return quorumOf(totalRf);
+      case "ALL": return totalRf;
       default: return 1;
     }
   }
@@ -583,59 +706,96 @@
   }
 
   // ---------- layout ----------
+  // Datacenters are laid out left-to-right as their own super-groups (each with a label and a
+  // border), and each datacenter contains its own zones/racks laid out exactly like the
+  // single-DC case used to. With numDcs === 1 this collapses back to the original layout.
   function computeLayoutDims() {
-    const nodesPerRack = state.numNodes / state.numRacks;
+    const nodesPerRack = state.nodesPerRack;
     const colH = RACK_PAD_TOP + nodesPerRack * NODE_H + Math.max(0, nodesPerRack - 1) * NODE_V_GAP + RACK_PAD_BOTTOM;
-    const racksTotalW = state.numRacks * NODE_W + (state.numRacks - 1) * RACK_GAP;
-    const clientsStackH = state.numClients * CLIENT_CARD_H + Math.max(0, state.numClients - 1) * CLIENT_STACK_GAP;
-    const contentH = Math.max(colH, clientsStackH);
+    const racksTotalWPerDc = state.numRacks * NODE_W + (state.numRacks - 1) * RACK_GAP;
+    // Each rack enclosure overhangs its node column by RACK_PAD_X per side, so the DC border has
+    // to clear both to sit DC_PAD_X away from the outermost rack rect rather than flush against
+    // it; below the racks DC_PAD_BOTTOM matches that clearance, and above it DC_LABEL_H is the
+    // same clearance plus room for the DC's own label.
+    const dcBoxW = racksTotalWPerDc + (RACK_PAD_X + DC_PAD_X) * 2;
+    const dcBoxH = DC_LABEL_H + colH + DC_PAD_BOTTOM;
+    const dcsTotalW = state.numDcs * dcBoxW + (state.numDcs - 1) * DC_GAP;
+    const cardH = clientCardH();
+    const clientsStackH = state.numClients * cardH + Math.max(0, state.numClients - 1) * CLIENT_STACK_GAP;
+    const contentH = Math.max(dcBoxH, clientsStackH);
     const clientX = STAGE_PAD + CLIENT_W / 2;
-    const racksStartX = clientX + CLIENT_W / 2 + CLIENT_MARGIN;
-    const racksTopY = STAGE_PAD;
-    const width = racksStartX + racksTotalW + STAGE_PAD;
-    const height = racksTopY + contentH + STAGE_PAD;
+    const dcsStartX = clientX + CLIENT_W / 2 + CLIENT_MARGIN;
+    // The DC row and the client stack are each centered in the content band, so a short DC row
+    // next to a tall client stack (or the other way round) stays visually paired rather than
+    // both being pinned to the top.
+    const dcsTopY = STAGE_PAD + Math.max(0, (contentH - dcBoxH) / 2);
+    const width = dcsStartX + dcsTotalW + STAGE_PAD;
+    const height = STAGE_PAD + contentH + STAGE_PAD;
     // No large fixed floor here on purpose — the stage should hug its actual content (fewer
     // nodes/racks/clients means a visibly smaller frame) rather than always padding out to a
     // fixed minimum canvas size.
-    return { nodesPerRack, colH, contentH, racksStartX, racksTopY, clientX, width: Math.max(360, width), height: Math.max(240, height) };
+    return {
+      nodesPerRack, colH, dcBoxW, dcBoxH, contentH, dcsStartX, dcsTopY, clientX, cardH,
+      width: Math.max(360, width), height: Math.max(240, height),
+    };
   }
 
   function layout() {
+    // Any request still in flight holds references to the node objects we're about to replace.
+    // Bumping the generation makes those requests unwind at their next checkpoint instead of
+    // applying writes into orphaned nodes; releasing the step pause lets a paused one get there.
+    state.gen++;
+    resolvePendingStep();
+    state.stepOwner = null;
+
     const dims = computeLayoutDims();
     state.dims = dims;
     stageEl.setAttribute("viewBox", `0 0 ${dims.width} ${dims.height}`);
 
-    const n = state.numNodes;
-    const nodesPerRack = n / state.numRacks;
+    const nodesPerRack = state.nodesPerRack;
+    const nodesPerDc = state.numRacks * nodesPerRack;
     state.nodes = [];
-    for (let i = 0; i < n; i++) {
-      const rack = Math.floor(i / nodesPerRack);
-      const slotIdx = i % nodesPerRack;
-      const colLeft = dims.racksStartX + rack * (NODE_W + RACK_GAP);
-      const slotTop = dims.racksTopY + RACK_PAD_TOP + slotIdx * (NODE_H + NODE_V_GAP);
-      state.nodes.push({
-        id: "N" + i,
-        idx: i,
-        rack,
-        x: colLeft + NODE_W / 2,
-        y: slotTop + NODE_H / 2,
-        up: true,
-        data: {},
-      });
+    let globalIdx = 0;
+    for (let dc = 0; dc < state.numDcs; dc++) {
+      const dcLeft = dims.dcsStartX + dc * (dims.dcBoxW + DC_GAP);
+      for (let i = 0; i < nodesPerDc; i++) {
+        const rack = Math.floor(i / nodesPerRack);
+        const slotIdx = i % nodesPerRack;
+        const colLeft = dcLeft + DC_PAD_X + RACK_PAD_X + rack * (NODE_W + RACK_GAP);
+        const slotTop = dims.dcsTopY + DC_LABEL_H + RACK_PAD_TOP + slotIdx * (NODE_H + NODE_V_GAP);
+        state.nodes.push({
+          id: (state.numDcs > 1 ? "DC" + dc + "-" : "") + "N" + i,
+          idx: globalIdx++,
+          dc,
+          rack,
+          x: colLeft + NODE_W / 2,
+          y: slotTop + NODE_H / 2,
+          up: true,
+          data: {},
+        });
+      }
     }
+    state.numNodes = state.nodes.length;
+
+    const prevClients = state.clients || [];
     const c = state.numClients;
     state.clients = [];
-    const clientsStackH = c * CLIENT_CARD_H + Math.max(0, c - 1) * CLIENT_STACK_GAP;
-    const firstCenterY = dims.racksTopY + dims.contentH / 2 - clientsStackH / 2 + CLIENT_CARD_H / 2;
+    const clientsStackH = c * dims.cardH + Math.max(0, c - 1) * CLIENT_STACK_GAP;
+    const firstCenterY = STAGE_PAD + dims.contentH / 2 - clientsStackH / 2 + dims.cardH / 2;
+    const writeYOffset = clientAnimYOffset("write"), readYOffset = clientAnimYOffset("read");
     for (let i = 0; i < c; i++) {
-      const y = firstCenterY + i * (CLIENT_CARD_H + CLIENT_STACK_GAP);
+      const y = firstCenterY + i * (dims.cardH + CLIENT_STACK_GAP);
+      // Carry over a client's manually-picked local DC across re-layouts (e.g. resizing racks);
+      // otherwise default to alternating clients evenly across the available datacenters.
+      const prevDc = prevClients[i] && prevClients[i].dc;
+      const dc = (prevDc !== undefined && prevDc < state.numDcs) ? prevDc : (i % state.numDcs);
       state.clients.push({
         id: "C" + (i + 1),
         x: dims.clientX,
         y,
-        animY: y + CLIENT_ANIM_Y_OFFSET,
-        writeX: dims.clientX - CLIENT_ICON_X_OFFSET,
-        readX: dims.clientX + CLIENT_ICON_X_OFFSET,
+        dc,
+        writeY: y + writeYOffset,
+        readY: y + readYOffset,
       });
     }
     renderStatic();
@@ -646,49 +806,93 @@
   // not a full ring.
   function renderRackBoxes() {
     rackBoxesLayer.innerHTML = "";
-    const { racksTopY, colH } = state.dims;
-    for (let r = 0; r < state.numRacks; r++) {
-      const colLeft = state.dims.racksStartX + r * (NODE_W + RACK_GAP);
-      const color = rackColor(r);
-      const g = document.createElementNS(svgNS, "g");
-      g.style.cursor = "pointer";
-      g.innerHTML = `
-        <title>Zone/Rack ${r} — click to kill/revive every node in it</title>
-        <rect class="rack-box" x="${colLeft - RACK_PAD_X}" y="${racksTopY}" width="${NODE_W + RACK_PAD_X * 2}" height="${colH}" rx="10" stroke="${color}"></rect>
-        <text class="rack-box-label" x="${colLeft + NODE_W / 2}" y="${racksTopY + 18}" fill="${color}">ZONE/RACK ${r}</text>
-      `;
-      g.addEventListener("click", () => toggleRack(r));
-      rackBoxesLayer.appendChild(g);
+    const { dcsStartX, dcsTopY, dcBoxW, dcBoxH, colH } = state.dims;
+    for (let dc = 0; dc < state.numDcs; dc++) {
+      const dcLeft = dcsStartX + dc * (dcBoxW + DC_GAP);
+      const racksTopY = dcsTopY + DC_LABEL_H;
+
+      // Datacenter super-group — only drawn when there's more than one DC, so single-DC mode
+      // renders identically to before.
+      if (state.numDcs > 1) {
+        const dg = document.createElementNS(svgNS, "g");
+        dg.style.cursor = "pointer";
+        dg.innerHTML = `
+          <title>DC${dc} — click to kill/revive every node in this datacenter</title>
+          <rect class="dc-box" x="${dcLeft}" y="${dcsTopY}" width="${dcBoxW}" height="${dcBoxH}" rx="12"></rect>
+          <text class="dc-box-label" x="${dcLeft + dcBoxW / 2}" y="${dcsTopY + DC_LABEL_H - 6}">DATACENTER ${dc}</text>
+        `;
+        dg.addEventListener("click", () => toggleDc(dc));
+        rackBoxesLayer.appendChild(dg);
+      }
+
+      for (let r = 0; r < state.numRacks; r++) {
+        const colLeft = dcLeft + DC_PAD_X + RACK_PAD_X + r * (NODE_W + RACK_GAP);
+        const color = rackColor(r);
+        const g = document.createElementNS(svgNS, "g");
+        g.style.cursor = "pointer";
+        g.innerHTML = `
+          <title>Zone/Rack ${r} — click to kill/revive every node in it</title>
+          <rect class="rack-box" x="${colLeft - RACK_PAD_X}" y="${racksTopY}" width="${NODE_W + RACK_PAD_X * 2}" height="${colH}" rx="10" stroke="${color}"></rect>
+          <text class="rack-box-label" x="${colLeft + NODE_W / 2}" y="${racksTopY + 18}" fill="${color}">ZONE/RACK ${r}</text>
+        `;
+        g.addEventListener("click", () => toggleRack(dc, r));
+        rackBoxesLayer.appendChild(g);
+      }
     }
   }
 
   function renderStatic() {
     renderRackBoxes();
 
-    // clients — each is a small card with its own round Write/Read icon buttons, so a request
-    // always originates from a specific, visible client rather than a random pick. The icons are
-    // inline SVG (a pencil for write, an eye for read) rather than the DS icon font, since the
-    // font file itself isn't vendored alongside this single-file demo.
-    const ICON_EDIT = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
-    const ICON_EYE = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    // clients — each is a small card with its own Write/Read pill buttons, so a request always
+    // originates from a specific, visible client rather than a random pick. The icons are inline
+    // SVG (a pencil for write, an eye for read) rather than the DS icon font, since the font file
+    // itself isn't vendored alongside this single-file demo.
+    const ICON_EDIT = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
+    const ICON_EYE = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    // Shared pill geometry: full card width, DS extra-small button type, fully rounded.
+    const btnStyle = `width:100%; height:${CLIENT_BTN_H}px; flex:none; gap:4px; padding:0 6px; font-size:${CLIENT_BTN_FS}px; border-radius:var(--radius-full);`;
     clientsLayer.innerHTML = "";
+    const cardH = clientCardH();
+    const multiDc = state.numDcs > 1;
     state.clients.forEach((c) => {
       const boxLeft = c.x - CLIENT_W / 2;
-      const boxTop = c.y - CLIENT_CARD_H / 2;
+      const boxTop = c.y - cardH / 2;
       const g = document.createElementNS(svgNS, "g");
       g.innerHTML = `
-        <rect class="client-box" x="${boxLeft}" y="${boxTop}" width="${CLIENT_W}" height="${CLIENT_CARD_H}" rx="9"></rect>
+        <rect class="client-box" x="${boxLeft}" y="${boxTop}" width="${CLIENT_W}" height="${cardH}" rx="9"></rect>
         <text class="client-label" x="${c.x}" y="${boxTop + CLIENT_PAD + CLIENT_LABEL_H / 2 + 1}">${c.id}</text>
       `;
+
+      // "Local DC" badge — only shown in multi-DC mode. Click to cycle this client's home
+      // datacenter, which drives LOCAL_ONE/LOCAL_QUORUM scope and DC-aware coordinator routing.
+      let dcBadgeY = boxTop + CLIENT_PAD + CLIENT_LABEL_H;
+      if (multiDc) {
+        const badge = document.createElementNS(svgNS, "g");
+        badge.style.cursor = "pointer";
+        badge.innerHTML = `
+          <title>Click to change ${c.id}'s local datacenter</title>
+          <text class="client-dc-badge" x="${c.x}" y="${dcBadgeY + CLIENT_DC_ROW_H / 2 + 1}">DC${c.dc} ⟳</text>
+        `;
+        badge.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          c.dc = (c.dc + 1) % state.numDcs;
+          log("info", `${c.id} local DC changed to DC${c.dc}`);
+          renderStatic();
+        });
+        g.appendChild(badge);
+        dcBadgeY += CLIENT_DC_ROW_H;
+      }
+
       const fo = document.createElementNS(svgNS, "foreignObject");
       fo.setAttribute("x", boxLeft + CLIENT_PAD);
-      fo.setAttribute("y", boxTop + CLIENT_PAD + CLIENT_LABEL_H + CLIENT_ROW_GAP);
+      fo.setAttribute("y", dcBadgeY + CLIENT_ROW_GAP);
       fo.setAttribute("width", CLIENT_W - CLIENT_PAD * 2);
-      fo.setAttribute("height", CLIENT_BTN_SIZE);
+      fo.setAttribute("height", CLIENT_BTNS_H);
       fo.innerHTML = `
-        <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex; justify-content:center; align-items:center; gap:${CLIENT_BTN_GAP}px; width:100%; height:100%;">
-          <button type="button" class="btn btn--fab btn--secondary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}</button>
-          <button type="button" class="btn btn--fab btn--primary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}</button>
+        <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex; flex-direction:column; justify-content:center; align-items:stretch; gap:${CLIENT_BTN_GAP}px; width:100%; height:100%;">
+          <button type="button" class="btn btn--xs btn--secondary" style="${btnStyle}" title="Send write from ${c.id}" data-title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}<span>Write</span></button>
+          <button type="button" class="btn btn--xs btn--primary" style="${btnStyle}" title="Send read from ${c.id}" data-title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}<span>Read</span></button>
         </div>
       `;
       const [writeBtn, readBtn] = fo.querySelectorAll("button");
@@ -697,6 +901,7 @@
       g.appendChild(fo);
       clientsLayer.appendChild(g);
     });
+    updateClientButtons(); // freshly rendered buttons must respect an active Step Mode lock
 
     renderNodes();
   }
@@ -738,7 +943,7 @@
       const subY = labelY + 12;
       const kvY = subY + 13;
       g.innerHTML = `
-        <title>${node.id} — Zone/Rack ${node.rack} — ${node.up ? "UP" : "DOWN"}</title>
+        <title>${node.id} — ${state.numDcs > 1 ? "DC" + node.dc + " " : ""}Zone/Rack ${node.rack} — ${node.up ? "UP" : "DOWN"}</title>
         <rect class="node-slot${node.up ? "" : " down"}" x="${slotX}" y="${slotY}" width="${NODE_W}" height="${NODE_H}" rx="9"></rect>
         <use href="#scyllaLogo" class="node-logo${node.up ? "" : " down"}" x="${logoX}" y="${logoY}" width="${LOGO_SIZE}" height="${LOGO_SIZE}"></use>
         <text class="node-label" x="${node.x}" y="${labelY}">${node.id}</text>
@@ -757,6 +962,9 @@
 
   // ---------- log ----------
   function log(kind, text) {
+    // Follow the newest line only when the reader is already at the bottom, so scrolling back to
+    // re-read an earlier hop isn't yanked away by the next one.
+    const following = logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 24;
     const line = document.createElement("div");
     line.className = "log-line " + kind;
     const now = new Date();
@@ -765,6 +973,7 @@
     line.innerHTML = `<span class="t">${t}</span><span class="tag">${tagText}</span><span>${text}</span>`;
     logBody.appendChild(line);
     while (logBody.children.length > 300) logBody.removeChild(logBody.firstChild);
+    if (following) logBody.scrollTop = logBody.scrollHeight;
   }
 
   // ---------- animation ----------
@@ -866,6 +1075,55 @@
     document.querySelectorAll(".node-slot").forEach((el) => el.classList.remove("coordinator", "replica"));
   }
 
+  // ---------- step control ----------
+  // When Step Mode is on, a request pauses at each major hop and waits for an explicit "Next
+  // Step" click instead of animating straight through. There is exactly one "Next Step" button,
+  // so a stepped request takes a lock for its whole lifetime: a second request would otherwise
+  // claim the button and strand the first one mid-flight, half-applied and never cleaned up.
+  function stepLocked() { return state.stepMode && state.stepOwner !== null; }
+
+  function updateClientButtons() {
+    const locked = stepLocked();
+    clientsLayer.querySelectorAll("button").forEach((b) => {
+      b.disabled = locked;
+      // A dimmed button with no explanation is a dead end — say why it's unavailable.
+      b.title = locked
+        ? `Step Mode: ${state.stepOwner}'s request is mid-flight — advance it with "Next Step ▶" (or turn Step Mode off)`
+        : b.dataset.title;
+    });
+  }
+
+  function resolvePendingStep() {
+    if (state.pendingStep) {
+      const resolve = state.pendingStep.resolve;
+      state.pendingStep = null;
+      btnNextStep.disabled = true;
+      stepStatusText.textContent = "—";
+      resolve();
+    }
+  }
+
+  function awaitStep(reqId, ownerId, desc) {
+    if (!state.stepMode) return Promise.resolve();
+    return new Promise((resolve) => {
+      state.pendingStep = { reqId, resolve };
+      state.stepOwner = ownerId;
+      updateClientButtons();
+      btnNextStep.disabled = false;
+      stepStatusText.textContent = desc;
+      log("info", `⏸ ${desc} — click "Next Step ▶" to continue`);
+    });
+  }
+
+  // Called when a request finishes or unwinds, so the next one can start.
+  function releaseStepLock(reqId, ownerId) {
+    if (state.pendingStep && state.pendingStep.reqId === reqId) resolvePendingStep();
+    if (state.stepOwner === ownerId) {
+      state.stepOwner = null;
+      updateClientButtons();
+    }
+  }
+
   // ---------- core simulation ----------
   // Mirrors the Cassandra/Scylla coordinator contract: the coordinator fails fast with
   // UNAVAILABLE if its failure detector already knows too few natural replicas are live to
@@ -874,12 +1132,33 @@
   // has no reason to expect an answer — and replies to the client the instant CL acks arrive,
   // without waiting for the rest. The client gets back an ACK carrying the value on success,
   // or a NACK on any failure path.
+  //
+  // Multi-DC awareness: LOCAL_ONE/LOCAL_QUORUM only ever build a plan out of the COORDINATOR's
+  // datacenter's natural replicas (the remote DC is never contacted). EACH_QUORUM builds a plan
+  // out of every DC's replicas but requires an independent quorum in every DC. Every other level
+  // (ANY/ONE/QUORUM/ALL) builds a plan out of every DC's replicas and counts acks cluster-wide.
   async function sendRequest(type, client) {
+    // Step Mode serializes requests — see stepLocked().
+    if (stepLocked()) {
+      log("warn", `Step Mode: ${state.stepOwner}'s request is still in flight — finish it with "Next Step ▶" (or turn Step Mode off) before sending another`);
+      return;
+    }
+
     const myGen = state.gen;
     const stale = () => state.gen !== myGen;
-    // Message lines start from whichever icon was actually clicked — the pencil for a write,
-    // the eye for a read — rather than a neutral point between them.
-    const clientAnimX = type === "write" ? client.writeX : client.readX;
+    const reqId = ++state.reqSeq;
+    try {
+      await runRequest(type, client, reqId, myGen, stale);
+    } finally {
+      releaseStepLock(reqId, client.id);
+      if (stale()) clearHighlight();
+    }
+  }
+
+  async function runRequest(type, client, reqId, myGen, stale) {
+    // Message lines start from whichever pill was actually clicked — Write on the upper row,
+    // Read on the lower one — rather than a neutral point between them.
+    const clientAnimY = type === "write" ? client.writeY : client.readY;
 
     const key = keySelect.value || KEYS[0];
     // Every write auto-increments that key's own counter (1, 2, 3, …) rather than reusing
@@ -899,56 +1178,125 @@
       return;
     }
 
-    const n = state.numNodes;
-    const rf = Math.min(state.rf, n);
-    const tokenStart = tokenIndexForKey(key, n);
-    const replicaIdxs = computeReplicaIdxs(tokenStart, rf, n);
-    const replicas = replicaIdxs.map((i) => state.nodes[i]);
-    const distinctRacks = new Set(replicas.map((r) => r.rack)).size;
-    const req = requiredAcks(state.cl, rf);
-    const anyHintFallback = state.cl === "ANY" && type === "write";
+    const cl = state.cl;
+    const localScope = isLocalCl(cl);
+    const eachScope = cl === "EACH_QUORUM";
 
-    // A smart (token-aware) driver knows which nodes hold the key and routes straight to one of
-    // them as coordinator, skipping the extra proxy hop. A non-token-aware driver instead goes
-    // through whatever node it's connected to, which is deliberately forced to a non-replica
-    // here so every replica hop is a real network round trip.
-    let coordinatorPool = upNodes;
+    // The driver's view of the ring: natural replicas in EVERY datacenter. Token-aware routing
+    // picks a coordinator out of this full set; the request's CL scope narrows it further below.
+    const allReplicasByDc = {};
+    for (let dc = 0; dc < state.numDcs; dc++) allReplicasByDc[dc] = replicasInDc(dc, key);
+    const allReplicaIdxSet = new Set(Object.values(allReplicasByDc).flat().map((r) => r.idx));
+
+    // DC-aware load balancing: the driver only ever hands the request to a node in its own local
+    // datacenter. Modern drivers default to zero remote hosts, so a dead local DC surfaces as a
+    // client-side NoHostAvailable rather than a silent failover into the remote datacenter.
+    const localDcUp = upNodes.filter((nd) => nd.dc === client.dc);
+    if (state.numDcs > 1 && localDcUp.length === 0) {
+      log("fail", `${client.id}: NoHostAvailable — no live node in DC${client.dc}, the client's local datacenter. A DC-aware driver policy does not fail over to remote DCs.`);
+      return;
+    }
+    const basePool = localDcUp.length > 0 ? localDcUp : upNodes;
+    let coordinatorPool = basePool;
     let forcedReplica = false;
     let forcedNonReplica = false;
     if (state.smartDrivers) {
-      const replicaUp = upNodes.filter((nd) => replicaIdxs.includes(nd.idx));
+      const replicaUp = basePool.filter((nd) => allReplicaIdxSet.has(nd.idx));
       if (replicaUp.length > 0) { coordinatorPool = replicaUp; forcedReplica = true; }
     } else {
-      const nonReplicaUp = upNodes.filter((nd) => !replicaIdxs.includes(nd.idx));
+      const nonReplicaUp = basePool.filter((nd) => !allReplicaIdxSet.has(nd.idx));
       if (nonReplicaUp.length > 0) { coordinatorPool = nonReplicaUp; forcedNonReplica = true; }
     }
     const coordinator = coordinatorPool[Math.floor(Math.random() * coordinatorPool.length)];
 
-    highlightCoordinatorAndReplicas(coordinator, replicaIdxs);
+    // "Local" means the COORDINATOR's datacenter, not the client's — verified against a real
+    // 2-DC cluster: with the client's DC fully down and the coordinator pinned to the other DC,
+    // LOCAL_QUORUM and LOCAL_ONE both still succeed against the coordinator's own DC.
+    const localDc = coordinator.dc;
+    const dcsInvolved = localScope ? [localDc] : Array.from({ length: state.numDcs }, (_, i) => i);
 
-    // What the coordinator's failure detector already believes, before sending a single message
+    const replicasByDc = {};
+    dcsInvolved.forEach((dc) => { replicasByDc[dc] = allReplicasByDc[dc]; });
+    const replicas = dcsInvolved.flatMap((dc) => replicasByDc[dc]);
+    const replicaIdxSet = new Set(replicas.map((r) => r.idx));
+    const dcSpanNote = dcsInvolved
+      .map((dc) => {
+        const rs = replicasByDc[dc];
+        const distinctRacks = new Set(rs.map((r) => r.rack)).size;
+        return `${state.numDcs > 1 ? "DC" + dc + ":" : ""}${distinctRacks}/${state.numRacks}z`;
+      })
+      .join(" ");
+
+    // Ack requirement — either one cluster-wide number, or (for EACH_QUORUM) one number PER DC
+    // that must each be independently satisfied.
+    let need = null;
+    let perDcNeed = null;
+    if (eachScope) {
+      perDcNeed = {};
+      dcsInvolved.forEach((dc) => { perDcNeed[dc] = requiredAcksLocal(cl, replicasByDc[dc].length); });
+    } else if (localScope) {
+      need = requiredAcksLocal(cl, replicasByDc[client.dc].length);
+    } else {
+      need = requiredAcksTotal(cl, replicas.length);
+    }
+    const anyHintFallback = cl === "ANY" && type === "write";
+    const rfTotal = replicas.length;
+
+    highlightCoordinatorAndReplicas(coordinator, [...replicaIdxSet]);
+
+    // What the coordinator's failure detector already believes, before sending a single message.
     const plan = replicas.map((r) => {
       const isSelf = r.idx === coordinator.idx;
       return { replica: r, isSelf, reachable: isSelf || r.up };
     });
     const knownReachable = plan.filter((p) => p.reachable).length;
+    const knownReachableByDc = {};
+    dcsInvolved.forEach((dc) => { knownReachableByDc[dc] = plan.filter((p) => p.replica.dc === dc && p.reachable).length; });
+
     const readNote = type === "read" ? " [full read + digest reads]" : "";
     const coordNote = state.smartDrivers
       ? (forcedReplica ? " [smart driver routed directly to a replica]" : " [no live replica available, coordinator is a non-replica]")
       : (forcedNonReplica ? " [non-token-aware: coordinator forced ≠ replica]" : " [no non-replica node available, coordinator is a replica]");
+    const dcNote = state.numDcs > 1
+      ? ` [coordinator in DC${localDc}${localScope ? `, so LOCAL_* scope = DC${localDc}` : ""}]`
+      : "";
+    const needNote = eachScope
+      ? dcsInvolved.map((dc) => `DC${dc} ${perDcNeed[dc]}/${replicasByDc[dc].length}`).join(", ")
+      : `${need}/${rfTotal}`;
 
-    log("info", `${client.id} → ${coordinator.id}: ${type.toUpperCase()} (${opLabel}) coordinator, natural replicas [${replicas.map((r) => r.id).join(", ")}] spanning ${distinctRacks}/${state.numRacks} zones/racks @ CL=${state.cl} needs ${req}/${rf}${readNote}${coordNote}`);
+    log("info", `${client.id} → ${coordinator.id}: ${type.toUpperCase()} (${opLabel}) coordinator, natural replicas [${replicas.map((r) => r.id).join(", ")}] (${dcSpanNote}) @ CL=${cl} needs ${needNote}${readNote}${coordNote}${dcNote}`);
 
-    await animatePacket(clientAnimX, client.animY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
+    await awaitStep(reqId, client.id, `Step 1/3 — ${client.id} → ${coordinator.id}: send ${type.toUpperCase()} (${opLabel})`);
+    if (stale()) return;
+    await animatePacket(client.x, clientAnimY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
     if (stale()) return;
 
-    if (knownReachable < req && !anyHintFallback) {
-      log("fail", `${coordinator.id}: UNAVAILABLE — only ${knownReachable}/${rf} replicas reachable, need ${req}. Rejected before contacting replicas (fail-fast).`);
-      log("fail", `${coordinator.id} → ${client.id}: NACK (${key})`);
-      await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 220 * SLOWDOWN, fail: true, label: `NACK ${key}`, type, insetEnd: 0 });
+    // ANY and EACH_QUORUM are write-only: the coordinator rejects the query outright before it
+    // ever looks at replicas. Wording matches what a real ScyllaDB 6.2 coordinator returns.
+    if (type === "read" && isWriteOnlyCl(cl)) {
+      log("fail", `${coordinator.id}: InvalidRequest (code=2200) — "${cl} ConsistencyLevel is only supported for writes". Query rejected; no replicas contacted.`);
+      log("fail", `${coordinator.id} → ${client.id}: ERROR (${key})`);
+      await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 220 * SLOWDOWN, fail: true, label: "InvalidRequest", type, insetEnd: 0 });
       clearHighlight();
       return;
     }
+
+    const failFast = eachScope
+      ? dcsInvolved.some((dc) => knownReachableByDc[dc] < perDcNeed[dc])
+      : (knownReachable < need && !anyHintFallback);
+    if (failFast) {
+      const reason = eachScope
+        ? `EACH_QUORUM not reachable in every DC (${dcsInvolved.map((dc) => `DC${dc} ${knownReachableByDc[dc]}/${perDcNeed[dc]}`).join(", ")})`
+        : `only ${knownReachable}/${rfTotal} replicas reachable, need ${need}`;
+      log("fail", `${coordinator.id}: UNAVAILABLE — ${reason}. Rejected before contacting replicas (fail-fast).`);
+      log("fail", `${coordinator.id} → ${client.id}: NACK (${key})`);
+      await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 220 * SLOWDOWN, fail: true, label: `NACK ${key}`, type, insetEnd: 0 });
+      clearHighlight();
+      return;
+    }
+
+    await awaitStep(reqId, client.id, `Step 2/3 — ${coordinator.id} fans out to ${plan.filter((p) => p.reachable).length} replica(s)`);
+    if (stale()) return;
 
     // Which contacted replica serves the full read: the coordinator's own local copy if it's a
     // natural replica, otherwise the first remote *reachable* replica contacted — everyone else
@@ -988,39 +1336,57 @@
       return { ...p, ok: true };
     })());
 
-    // Race to quorum: resolve as soon as `req` acks land — a real coordinator does not wait
-    // for the slower or unreachable replicas once CL is satisfied.
-    let ackCount = 0, decided = false, decidedEarly = false, decide;
+    // Race to CL: resolve as soon as the requirement is met — a real coordinator does not wait
+    // for the slower or unreachable replicas once CL is satisfied. For EACH_QUORUM this means
+    // every DC independently reaching its own quorum before the coordinator can reply.
+    let decided = false, decidedEarly = false, decide;
     const decision = new Promise((resolve) => { decide = resolve; });
+    let ackCount = 0;
+    const ackCountByDc = {};
+    dcsInvolved.forEach((dc) => { ackCountByDc[dc] = 0; });
     settleTasks.forEach((p) => p.then((r) => {
-      if (r.ok) {
-        ackCount++;
-        if (!decided && ackCount >= req) { decided = true; decidedEarly = true; decide(ackCount); }
-      }
+      if (!r.ok) return;
+      ackCount++;
+      ackCountByDc[r.replica.dc] = (ackCountByDc[r.replica.dc] || 0) + 1;
+      if (decided) return;
+      const satisfied = eachScope
+        ? dcsInvolved.every((dc) => ackCountByDc[dc] >= perDcNeed[dc])
+        : ackCount >= need;
+      if (satisfied) { decided = true; decidedEarly = true; decide({ ackCount, ackCountByDc }); }
     }));
-    Promise.all(settleTasks).then(() => { if (!decided) { decided = true; decide(ackCount); } });
+    Promise.all(settleTasks).then(() => { if (!decided) { decided = true; decide({ ackCount, ackCountByDc }); } });
 
-    const acksAtDecision = await decision;
+    const decision_ = await decision;
     if (stale()) return;
+    const acksAtDecision = decision_.ackCount;
+    const acksAtDecisionByDc = decision_.ackCountByDc;
     const hinted = anyHintFallback && acksAtDecision === 0;
-    const success = anyHintFallback ? true : acksAtDecision >= req;
+    const success = anyHintFallback ? true : eachScope
+      ? dcsInvolved.every((dc) => acksAtDecisionByDc[dc] >= perDcNeed[dc])
+      : acksAtDecision >= need;
 
     const primary = plan.find((p) => p.isSelf) || contacted.find((p) => p.label === "data");
     const primaryValue = primary ? capturedValues[primary.replica.idx] : undefined;
     const readValue = primaryValue !== undefined ? primaryValue : Object.values(capturedValues)[0];
 
     const replyLabel = !success ? `NACK ${key}` : type === "write" ? `ACK ${key}=${value}` : `ACK ${key}=${fmtVal(readValue)}`;
-    await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 260 * SLOWDOWN, fail: !success, label: replyLabel, type, insetEnd: 0 });
+
+    await awaitStep(reqId, client.id, `Step 3/3 — ${coordinator.id} → ${client.id}: reply with ${success ? "ACK" : "NACK"}`);
+    if (stale()) return;
+    await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 260 * SLOWDOWN, fail: !success, label: replyLabel, type, insetEnd: 0 });
     if (stale()) return;
 
+    const metNote = eachScope
+      ? dcsInvolved.map((dc) => `DC${dc} ${acksAtDecisionByDc[dc]}/${perDcNeed[dc]}`).join(", ")
+      : `${acksAtDecision}/${need}`;
     if (hinted) {
-      log("warn", `${coordinator.id} → ${client.id}: ACK (${key}=${value}, hinted handoff — 0/${rf} replicas ack'd, hint stored at coordinator)`);
+      log("warn", `${coordinator.id} → ${client.id}: ACK (${key}=${value}, hinted handoff — 0/${rfTotal} replicas ack'd, hint stored at coordinator)`);
     } else if (success) {
       const earlyNote = decidedEarly ? " — coordinator replied without waiting for the remaining replicas" : "";
       const valueNote = type === "write" ? `${key}=${value}` : `${key}=${fmtVal(readValue)}`;
-      log("success", `${coordinator.id} → ${client.id}: ACK (${valueNote}) — CL=${state.cl} met at ${acksAtDecision}/${rf} acks, needed ${req}${earlyNote}`);
+      log("success", `${coordinator.id} → ${client.id}: ACK (${valueNote}) — CL=${cl} met (${metNote} acks needed)${earlyNote}`);
     } else {
-      log("fail", `${coordinator.id} → ${client.id}: NACK (${key}) — only ${acksAtDecision}/${rf} replicas ack'd within the timeout, needed ${req}`);
+      log("fail", `${coordinator.id} → ${client.id}: NACK (${key}) — CL=${cl} not met within the timeout (${metNote} acks needed)`);
     }
 
     Promise.all(settleTasks).then(() => setTimeout(clearHighlight, 150));
@@ -1031,27 +1397,57 @@
   // meant to survive, since a key's replicas are spread across racks rather than clustered in
   // one. Mirrors the per-node click toggle: any node up -> take the whole rack down; otherwise
   // bring it back.
-  function toggleRack(rackIdx) {
-    const members = state.nodes.filter((n) => n.rack === rackIdx);
+  function toggleRack(dcIdx, rackIdx) {
+    const members = state.nodes.filter((n) => n.dc === dcIdx && n.rack === rackIdx);
+    const anyUp = members.some((n) => n.up);
+    members.forEach((n) => (n.up = !anyUp));
+    const dcLabel = state.numDcs > 1 ? `DC${dcIdx}/` : "";
+    log(anyUp ? "warn" : "info", anyUp
+      ? `${dcLabel}Zone/Rack ${rackIdx} DOWN — nodes [${members.map((n) => n.id).join(", ")}] failed together (simulated zone/rack outage)`
+      : `${dcLabel}Zone/Rack ${rackIdx} revived — nodes [${members.map((n) => n.id).join(", ")}] back UP`);
+    renderNodes();
+  }
+
+  // Clicking a whole datacenter's border toggles every node in it — the widest-blast-radius
+  // fault to demonstrate why EACH_QUORUM/ALL fail across a DC outage while LOCAL_* in the
+  // surviving DC keeps working.
+  function toggleDc(dcIdx) {
+    const members = state.nodes.filter((n) => n.dc === dcIdx);
     const anyUp = members.some((n) => n.up);
     members.forEach((n) => (n.up = !anyUp));
     log(anyUp ? "warn" : "info", anyUp
-      ? `Zone/Rack ${rackIdx} DOWN — nodes [${members.map((n) => n.id).join(", ")}] failed together (simulated zone/rack outage)`
-      : `Zone/Rack ${rackIdx} revived — nodes [${members.map((n) => n.id).join(", ")}] back UP`);
+      ? `DC${dcIdx} DOWN — all ${members.length} nodes in this datacenter failed together (simulated DC outage)`
+      : `DC${dcIdx} revived — all ${members.length} nodes in this datacenter back UP`);
     renderNodes();
   }
 
   // ---------- wiring ----------
   // Recompute the derived total node count whenever zones or nodes-per-zone change, and clamp
   // RF (which can't exceed the node count) to match.
+  // RF is applied PER datacenter (like NetworkTopologyStrategy), so each DC's slider is capped
+  // by the node count within a single DC, not the cluster-wide total.
   function applyNodeCount() {
-    state.numNodes = state.numRacks * state.nodesPerRack;
-    const maxRf = Math.min(5, state.numNodes);
-    rfRange.max = maxRf;
-    if (state.rf > maxRf) { state.rf = maxRf; rfRange.value = maxRf; rfVal.textContent = maxRf; }
+    const nodesPerDc = state.numRacks * state.nodesPerRack;
+    const maxRf = Math.min(5, nodesPerDc);
+    [[rfRange, rfVal, 0], [rfRange1, rfVal1, 1]].forEach(([range, valEl, dc]) => {
+      range.max = maxRf;
+      if (state.rfByDc[dc] > maxRf) {
+        state.rfByDc[dc] = maxRf;
+        range.value = maxRf;
+        valEl.textContent = maxRf;
+      }
+    });
     refreshClOptions();
     layout();
   }
+
+  multiDcToggle.addEventListener("change", () => {
+    state.numDcs = multiDcToggle.checked ? 2 : 1;
+    const multi = state.numDcs > 1;
+    rfDc1Ctrl.style.display = multi ? "" : "none";
+    rfLabelText.textContent = multi ? "RF DC0" : "Replication Factor";
+    applyNodeCount();
+  });
 
   racksRange.addEventListener("input", () => {
     state.numRacks = Number(racksRange.value);
@@ -1066,14 +1462,31 @@
   });
 
   rfRange.addEventListener("input", () => {
-    state.rf = Number(rfRange.value);
-    rfVal.textContent = state.rf;
+    state.rfByDc[0] = Number(rfRange.value);
+    rfVal.textContent = state.rfByDc[0];
+    refreshClOptions();
+  });
+
+  rfRange1.addEventListener("input", () => {
+    state.rfByDc[1] = Number(rfRange1.value);
+    rfVal1.textContent = state.rfByDc[1];
     refreshClOptions();
   });
 
   clSelect.addEventListener("change", () => {
     state.cl = clSelect.value;
   });
+
+  stepModeToggle.addEventListener("change", () => {
+    state.stepMode = stepModeToggle.checked;
+    stepStatusCtrl.style.display = state.stepMode ? "" : "none";
+    // Turning Step Mode off mid-request must not strand it: release the pause so it runs to
+    // completion on its own, and drop the lock so the clients are clickable again.
+    if (!state.stepMode) resolvePendingStep();
+    updateClientButtons();
+  });
+
+  btnNextStep.addEventListener("click", () => resolvePendingStep());
 
   keySelect.addEventListener("change", () => {
     const nextVal = (state.writeCounters[keySelect.value] || 0) + 1;
@@ -1100,15 +1513,15 @@
   const TOUR_SEEN_KEY = "scylladb-ha-tour-seen";
   const tourSteps = [
     {
-      target: () => document.querySelector('#clientsLayer button[title^="Send write"]'),
+      target: () => document.querySelector('#clientsLayer button[data-title^="Send write"]'),
       title: "Send a write",
-      body: "Each client can act on its own. Click the pencil to write the next value for the selected key from that client.",
+      body: "Each client can act on its own. Click Write to write the next value for the selected key from that client.",
       placement: "right",
     },
     {
-      target: () => document.querySelector('#clientsLayer button[title^="Send read"]'),
+      target: () => document.querySelector('#clientsLayer button[data-title^="Send read"]'),
       title: "Send a read",
-      body: "Click the eye to read the current value of the selected key from that client.",
+      body: "Click Read to read the current value of the selected key from that client.",
       placement: "right",
     },
     {
