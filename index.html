@@ -400,11 +400,11 @@
     </div>
     <div class="ctrl">
       <label><span id="rfLabelText">Replication Factor</span> <span class="val" id="rfVal">3</span></label>
-      <input type="range" id="rfRange" min="1" max="5" value="3" step="1" />
+      <input type="range" id="rfRange" min="0" max="5" value="3" step="1" />
     </div>
     <div class="ctrl" id="rfDc1Ctrl" style="display:none;" title="Each datacenter gets its own replication factor, exactly like NetworkTopologyStrategy's {'DC0': n, 'DC1': m}.">
       <label>RF DC1 <span class="val" id="rfVal1">3</span></label>
-      <input type="range" id="rfRange1" min="1" max="5" value="3" step="1" />
+      <input type="range" id="rfRange1" min="0" max="5" value="3" step="1" />
     </div>
     <div class="ctrl">
       <label>Consistency Level</label>
@@ -572,7 +572,8 @@
     numRacks: 3,      // zones/racks PER datacenter
     nodesPerRack: 2,
     // Replication factor per datacenter, indexed by DC — NetworkTopologyStrategy takes an
-    // independent RF for each DC, so these are not required to match.
+    // independent RF for each DC, so these are not required to match. RF=0 is a valid value
+    // for a DC (that keyspace simply has no replicas there, matching real NetworkTopologyStrategy).
     rfByDc: [3, 3],
     cl: "QUORUM",
     numClients: 2,
