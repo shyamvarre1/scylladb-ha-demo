@@ -181,7 +181,7 @@
     font-size: 12px;
     padding-right: 10px;
     display: flex;
-    flex-direction: column-reverse;
+    flex-direction: column;
   }
   .log-line {
     padding: 3px 0;
@@ -492,30 +492,37 @@
                             // DC_LABEL_H instead, which is that plus room for the DC label)
   const DC_LABEL_H = 20;    // extra headroom above each DC's rack boxes for its own label
 
-  // Each client is a small card with its own round Write/Read icon buttons — request always
+  // Each client is a small card with its own Write/Read pill buttons — request always
   // originates from a specific client, not a random pick, so it's obvious which one issued it.
+  // The pills are stacked one per row at full card width rather than side by side: spelling the
+  // words out doubles a button's width, and two of those in a row would make each client card
+  // wider than a whole rack column, so the client tier would read as the main subject of the
+  // diagram instead of the cluster. Stacked, the card stays its original ~75 units wide.
   const CLIENT_PAD = 6;
   const CLIENT_LABEL_H = 18;
-  const CLIENT_BTN_SIZE = 28;
-  const CLIENT_BTN_GAP = 8;   // horizontal gap between the two round buttons
-  const CLIENT_ROW_GAP = 6;   // vertical gap between the label and the button row
-  const CLIENT_W = CLIENT_PAD * 2 + CLIENT_BTN_SIZE * 2 + CLIENT_BTN_GAP;
+  const CLIENT_BTN_H = 22;    // pill height
+  const CLIENT_BTN_W = 62;    // pill width — sized for the icon plus the longer of the two words
+  const CLIENT_BTN_FS = 11;   // pill label size, in step with .client-label's 10.5px
+  const CLIENT_BTN_GAP = 6;   // vertical gap between the two stacked pills
+  const CLIENT_ROW_GAP = 6;   // vertical gap between the label and the button block
+  const CLIENT_W = CLIENT_PAD * 2 + CLIENT_BTN_W;
   const CLIENT_DC_ROW_H = 16; // extra row for the "local DC" badge, only shown when numDcs > 1
-  const CLIENT_CARD_H_BASE = CLIENT_PAD * 2 + CLIENT_LABEL_H + CLIENT_ROW_GAP + CLIENT_BTN_SIZE;
+  const CLIENT_BTNS_H = CLIENT_BTN_H * 2 + CLIENT_BTN_GAP;
+  const CLIENT_CARD_H_BASE = CLIENT_PAD * 2 + CLIENT_LABEL_H + CLIENT_ROW_GAP + CLIENT_BTNS_H;
   const CLIENT_STACK_GAP = 18; // vertical gap between stacked client cards
   // Card height grows by one row when the "local DC" badge is shown (multi-DC mode).
   function clientCardH() { return CLIENT_CARD_H_BASE + (state.numDcs > 1 ? CLIENT_DC_ROW_H : 0); }
-  // The label above the buttons (and the DC badge, when shown) pushes their row below the card's
-  // true geometric center — this offset re-centers a client's message lines on the button row
-  // itself, not the whole card.
-  function clientAnimYOffset() {
-    const dcRow = state.numDcs > 1 ? CLIENT_DC_ROW_H : 0;
-    return CLIENT_PAD + CLIENT_LABEL_H + dcRow + CLIENT_ROW_GAP + CLIENT_BTN_SIZE / 2 - clientCardH() / 2;
+  // Distance from the top of a client card down to the top of its button block — the label, and
+  // the DC badge when it's shown, sit above it.
+  function clientBtnsTopOffset() {
+    return CLIENT_PAD + CLIENT_LABEL_H + (state.numDcs > 1 ? CLIENT_DC_ROW_H : 0) + CLIENT_ROW_GAP;
   }
-  // The write (pencil) and read (eye) buttons sit side by side with no slack in the row — its
-  // width is exactly 2 buttons + the gap — so each button's center is this far from the card's
-  // horizontal center, symmetric left/right.
-  const CLIENT_ICON_X_OFFSET = (CLIENT_BTN_SIZE + CLIENT_BTN_GAP) / 2;
+  // The buttons are stacked, so a request's message lines leave from the vertical center of
+  // whichever pill was pressed rather than from the card's own (higher) geometric center.
+  function clientAnimYOffset(type) {
+    const row = type === "write" ? 0 : 1;
+    return clientBtnsTopOffset() + row * (CLIENT_BTN_H + CLIENT_BTN_GAP) + CLIENT_BTN_H / 2 - clientCardH() / 2;
+  }
 
   function fmtVal(v) { return v === undefined ? "∅" : v; }
 
@@ -581,7 +588,13 @@
 
   // ScyllaDB DS chart tokens (--chart-1..--chart-8) — theme-reactive categorical colors,
   // so rack coloring stays on-brand and adapts automatically across light/dark/scylla.
-  const RACK_CHART_VARS = ["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5", "--chart-6", "--chart-7", "--chart-8"];
+  // --chart-3, --chart-4 and --chart-6 are deliberately left out: in every theme they alias
+  // warning-*, success-* and error-* respectively, which are the semantic status colors used
+  // for node UP, WARN and failed messages. A purely decorative rack border in one of those
+  // reads as a rack stuck in a warning/failed/healthy state, so the ramp skips them.
+  // Ordered widest-hue-gap first (blue 234 / violet 293 / magenta 357) so that the racks actually
+  // on screen stay easy to tell apart — --chart-5 is a near-twin of --chart-1 and sits last.
+  const RACK_CHART_VARS = ["--chart-1", "--chart-2", "--chart-7", "--chart-8", "--chart-5"];
   function rackColor(rackIdx) { return `var(${RACK_CHART_VARS[rackIdx % RACK_CHART_VARS.length]})`; }
 
   const state = {
@@ -769,7 +782,7 @@
     state.clients = [];
     const clientsStackH = c * dims.cardH + Math.max(0, c - 1) * CLIENT_STACK_GAP;
     const firstCenterY = STAGE_PAD + dims.contentH / 2 - clientsStackH / 2 + dims.cardH / 2;
-    const animYOffset = clientAnimYOffset();
+    const writeYOffset = clientAnimYOffset("write"), readYOffset = clientAnimYOffset("read");
     for (let i = 0; i < c; i++) {
       const y = firstCenterY + i * (dims.cardH + CLIENT_STACK_GAP);
       // Carry over a client's manually-picked local DC across re-layouts (e.g. resizing racks);
@@ -781,9 +794,8 @@
         x: dims.clientX,
         y,
         dc,
-        animY: y + animYOffset,
-        writeX: dims.clientX - CLIENT_ICON_X_OFFSET,
-        readX: dims.clientX + CLIENT_ICON_X_OFFSET,
+        writeY: y + writeYOffset,
+        readY: y + readYOffset,
       });
     }
     renderStatic();
@@ -836,8 +848,10 @@
     // always originates from a specific, visible client rather than a random pick. The icons are
     // inline SVG (a pencil for write, an eye for read) rather than the DS icon font, since the
     // font file itself isn't vendored alongside this single-file demo.
-    const ICON_EDIT = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
-    const ICON_EYE = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    const ICON_EDIT = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
+    const ICON_EYE = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+    // Shared pill geometry: full card width, DS extra-small button type, fully rounded.
+    const btnStyle = `width:100%; height:${CLIENT_BTN_H}px; flex:none; gap:4px; padding:0 6px; font-size:${CLIENT_BTN_FS}px; border-radius:var(--radius-full);`;
     clientsLayer.innerHTML = "";
     const cardH = clientCardH();
     const multiDc = state.numDcs > 1;
@@ -874,11 +888,11 @@
       fo.setAttribute("x", boxLeft + CLIENT_PAD);
       fo.setAttribute("y", btnsTopY + CLIENT_ROW_GAP);
       fo.setAttribute("width", CLIENT_W - CLIENT_PAD * 2);
-      fo.setAttribute("height", CLIENT_BTN_SIZE);
+      fo.setAttribute("height", CLIENT_BTNS_H);
       fo.innerHTML = `
-        <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex; justify-content:center; align-items:center; gap:${CLIENT_BTN_GAP}px; width:100%; height:100%;">
-          <button type="button" class="btn btn--fab btn--secondary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send write from ${c.id}" data-title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}</button>
-          <button type="button" class="btn btn--fab btn--primary" style="width:${CLIENT_BTN_SIZE}px; height:${CLIENT_BTN_SIZE}px; padding:0;" title="Send read from ${c.id}" data-title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}</button>
+        <div xmlns="http://www.w3.org/1999/xhtml" style="display:flex; flex-direction:column; justify-content:center; align-items:stretch; gap:${CLIENT_BTN_GAP}px; width:100%; height:100%;">
+          <button type="button" class="btn btn--xs btn--secondary" style="${btnStyle}" title="Send write from ${c.id}" data-title="Send write from ${c.id}" aria-label="Send write from ${c.id}">${ICON_EDIT}<span>Write</span></button>
+          <button type="button" class="btn btn--xs btn--primary" style="${btnStyle}" title="Send read from ${c.id}" data-title="Send read from ${c.id}" aria-label="Send read from ${c.id}">${ICON_EYE}<span>Read</span></button>
         </div>
       `;
       const [writeBtn, readBtn] = fo.querySelectorAll("button");
@@ -948,6 +962,9 @@
 
   // ---------- log ----------
   function log(kind, text) {
+    // Follow the newest line only when the reader is already at the bottom, so scrolling back to
+    // re-read an earlier hop isn't yanked away by the next one.
+    const following = logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 24;
     const line = document.createElement("div");
     line.className = "log-line " + kind;
     const now = new Date();
@@ -956,6 +973,7 @@
     line.innerHTML = `<span class="t">${t}</span><span class="tag">${tagText}</span><span>${text}</span>`;
     logBody.appendChild(line);
     while (logBody.children.length > 300) logBody.removeChild(logBody.firstChild);
+    if (following) logBody.scrollTop = logBody.scrollHeight;
   }
 
   // ---------- animation ----------
@@ -1138,9 +1156,9 @@
   }
 
   async function runRequest(type, client, reqId, myGen, stale) {
-    // Message lines start from whichever icon was actually clicked — the pencil for a write,
-    // the eye for a read — rather than a neutral point between them.
-    const clientAnimX = type === "write" ? client.writeX : client.readX;
+    // Message lines start from whichever pill was actually clicked — Write on the upper row,
+    // Read on the lower one — rather than a neutral point between them.
+    const clientAnimY = type === "write" ? client.writeY : client.readY;
 
     const key = keySelect.value || KEYS[0];
     // Every write auto-increments that key's own counter (1, 2, 3, …) rather than reusing
@@ -1255,7 +1273,7 @@
 
     await awaitStep(reqId, client.id, `Step 1/3 — ${client.id} → ${coordinator.id}: send ${type.toUpperCase()} (${opLabel})`);
     if (stale()) return;
-    await animatePacket(clientAnimX, client.animY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
+    await animatePacket(client.x, clientAnimY, coordinator.x, coordinator.y, { duration: 260 * SLOWDOWN, fail: false, label: opLabel, type, insetStart: 0 });
     if (stale()) return;
 
     // ANY and EACH_QUORUM are write-only: the coordinator rejects the query outright before it
@@ -1263,7 +1281,7 @@
     if (type === "read" && isWriteOnlyCl(cl)) {
       log("fail", `${coordinator.id}: InvalidRequest (code=2200) — "${cl} ConsistencyLevel is only supported for writes". Query rejected; no replicas contacted.`);
       log("fail", `${coordinator.id} → ${client.id}: ERROR (${key})`);
-      await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 220 * SLOWDOWN, fail: true, label: "InvalidRequest", type, insetEnd: 0 });
+      await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 220 * SLOWDOWN, fail: true, label: "InvalidRequest", type, insetEnd: 0 });
       clearHighlight();
       return;
     }
@@ -1277,7 +1295,7 @@
         : `only ${knownReachable}/${rfTotal} replicas reachable, need ${need}`;
       log("fail", `${coordinator.id}: UNAVAILABLE — ${reason}. Rejected before contacting replicas (fail-fast).`);
       log("fail", `${coordinator.id} → ${client.id}: NACK (${key})`);
-      await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 220 * SLOWDOWN, fail: true, label: `NACK ${key}`, type, insetEnd: 0 });
+      await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 220 * SLOWDOWN, fail: true, label: `NACK ${key}`, type, insetEnd: 0 });
       clearHighlight();
       return;
     }
@@ -1360,7 +1378,7 @@
 
     await awaitStep(reqId, client.id, `Step 3/3 — ${coordinator.id} → ${client.id}: reply with ${success ? "ACK" : "NACK"}`);
     if (stale()) return;
-    await animatePacket(coordinator.x, coordinator.y, clientAnimX, client.animY, { duration: 260 * SLOWDOWN, fail: !success, label: replyLabel, type, insetEnd: 0 });
+    await animatePacket(coordinator.x, coordinator.y, client.x, clientAnimY, { duration: 260 * SLOWDOWN, fail: !success, label: replyLabel, type, insetEnd: 0 });
     if (stale()) return;
 
     const metNote = eachScope
@@ -1501,13 +1519,13 @@
     {
       target: () => document.querySelector('#clientsLayer button[data-title^="Send write"]'),
       title: "Send a write",
-      body: "Each client can act on its own. Click the pencil to write the next value for the selected key from that client.",
+      body: "Each client can act on its own. Click Write to write the next value for the selected key from that client.",
       placement: "right",
     },
     {
       target: () => document.querySelector('#clientsLayer button[data-title^="Send read"]'),
       title: "Send a read",
-      body: "Click the eye to read the current value of the selected key from that client.",
+      body: "Click Read to read the current value of the selected key from that client.",
       placement: "right",
     },
     {
